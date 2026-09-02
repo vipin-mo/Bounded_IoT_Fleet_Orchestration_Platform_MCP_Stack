@@ -1,0 +1,8 @@
+services:
+  redis-fleet-cache:
+    image: redis:7.2-alpine
+    container_name: redis-fleet-cache
+    ports:
+      - "6379:6379"
+    restart: always
+    command: redis-server --appendonly yes
