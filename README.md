@@ -14,8 +14,8 @@ A production-grade, closed-loop automated vehicle remediation framework powered 
 graph TD
     Sim[Telemetry Simulator Engine] -->|Streams 1Hz Telemetry| Redis[(Redis In-Memory Cache)]
     Redis <-->|Read / Write Registers| Go[Go MCP Server Binary]
-    Go <-->|Stdio IPC Channel| Claude[Claude Haiku 4.5 Orchestrator]
-    Claude -->|Enforces Safety Invariants| Guard[Python Pre-Flight Guardrails]
+    Go <-->|Stdio IPC Channel| Guard[Python Pre-Flight Guardrails]
+    Guard <-->|Sanitizes Tool Output| Claude[Claude Haiku 4.5 Orchestrator]
 ```
 
 *   **AI Agent Orchestrator (Python)**: Drives the deterministic 5-step operational protocol using the `claude-haiku-4-5` engine. Handles multi-turn contextual reasoning, identifies pattern intersections, and constructs detailed markdown compliance ledgers.
