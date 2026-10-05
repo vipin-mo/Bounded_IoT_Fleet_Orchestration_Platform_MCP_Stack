@@ -4,6 +4,10 @@ import time
 import sys
 import redis
 
+# The detector needs enough older readings to build a baseline.
+HISTORY_WINDOW = 60
+
+
 def run_fleet_simulator():
     """Simulates real-time telemetry metrics for an IoT vehicle fleet, writing state data to Redis."""
     try:
@@ -45,14 +49,14 @@ def run_fleet_simulator():
                 "cabin_status": cabin_status
             })
 
-            # 2. Append directly to a rolling chronological list matrix (Constrained to the last 10 records)
+            # 2. Append to a rolling chronological list (constrained to the last HISTORY_WINDOW records)
             log_entry = json.dumps({
                 "timestamp": int(time.time()),
                 "speed": speed,
                 "battery_temp": battery_temp
             })
             r.lpush(log_key, log_entry)
-            r.ltrim(log_key, 0, 9)  # Atomic trimming discards older elements automatically
+            r.ltrim(log_key, 0, HISTORY_WINDOW - 1)
 
             # 3. Read back tracking overrides sent down from the agent loop
             power_param = r.hget(redis_key, "power_parameter")
@@ -61,6 +65,7 @@ def run_fleet_simulator():
 
         # Stream interval heartbeat
         time.sleep(1.0)
+
 
 if __name__ == "__main__":
     run_fleet_simulator()

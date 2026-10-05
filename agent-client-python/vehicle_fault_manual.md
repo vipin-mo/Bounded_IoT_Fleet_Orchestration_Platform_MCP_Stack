@@ -1,7 +1,7 @@
 # FLEET MANAGEMENT EXTRAORDINARY FAULT CODES MANUAL
 
 ## Error Code: ERR_BATT_THERMAL_RUNAWAY
-- **Trigger Metrics:** Moving window Z-score calculations above 2.5 on core vehicle battery temperature channels.
+- **Trigger Metrics:** Battery temperature stays well above the vehicle's own earlier baseline: a z-score above 2.5 sustained over the newest readings (classification `sustained_anomaly`), or a steady climb (`rising_trend`). A one-reading spike (`transient_spike`) is sensor noise and is not a trigger.
 - **Root Cause:** Cellular degradation of internal cooling gel layers or localized cooling fan micro-failures.
 - **Mitigation Directive:** The AI Orchestrator must deploy an Over-The-Air command setting the vehicle power mode parameter to 'eco_mode' to throttle core current draws and decrease thermodynamic dissipation rates.
 

@@ -46,6 +46,10 @@ func getString(m map[string]interface{}, key string) string {
 	return ""
 }
 
+func round2(x float64) float64 {
+	return math.Round(x*100) / 100
+}
+
 // HandleGetFleetSnapshot scans Redis hashes with structured validation protections
 func HandleGetFleetSnapshot(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
 	args := FleetSnapshotArgs{
@@ -159,80 +163,41 @@ func HandleGetHistoricalLogs(arguments map[string]interface{}) (*mcp.CallToolRes
 	}, nil
 }
 
-// HandleMLAnomalyAnalysis computes mathematical Z-Scores across runtime metrics windows
-func HandleMLAnomalyAnalysis(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
+// HandleStatAnomalyAnalysis compares a vehicle's newest battery temperatures with its own earlier
+// baseline. The maths lives in AnalyzeTemperatureSeries so it can be unit tested without Redis.
+func HandleStatAnomalyAnalysis(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
 	deviceID := getString(arguments, "device_id")
 	logKey := fmt.Sprintf("logs:%s", deviceID)
 
-	logs, err := database.RedisClient.LRange(database.Ctx, logKey, 0, 9).Result()
-	if err != nil || len(logs) < 3 {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{
-					Text: "Insufficient data windows for mathematical evaluation.",
-				},
-			},
-		}, nil
+	logs, err := database.RedisClient.LRange(database.Ctx, logKey, 0, HistoryWindow-1).Result()
+	if err != nil {
+		return nil, err
 	}
 
-	var temps []float64
-	var sum float64
-
-	for _, entry := range logs {
-		var parsed map[string]interface{}
-		if err := json.Unmarshal([]byte(entry), &parsed); err == nil {
-			if val, ok := parsed["battery_temp"]; ok {
-				var t float64
-				switch v := val.(type) {
-				case float64:
-					t = v
-				case string:
-					t, _ = strconv.ParseFloat(v, 64)
-				}
-				if t > 0 {
-					temps = append(temps, t)
-					sum += t
-				}
-			}
+	// Redis returns the newest entry first (LPUSH). Walk backwards to get oldest -> newest.
+	temps := make([]float64, 0, len(logs))
+	for i := len(logs) - 1; i >= 0; i-- {
+		var entry struct {
+			BatteryTemp float64 `json:"battery_temp"`
 		}
+		if err := json.Unmarshal([]byte(logs[i]), &entry); err != nil {
+			continue
+		}
+		temps = append(temps, entry.BatteryTemp)
 	}
 
-	if len(temps) < 3 {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{
-					Text: "Insufficient structural historical float fields extracted.",
-				},
-			},
-		}, nil
-	}
-
-	mean := sum / float64(len(temps))
-	var varianceSum float64
-	for _, t := range temps {
-		varianceSum += math.Pow(t-mean, 2)
-	}
-	stdDev := math.Sqrt(varianceSum / float64(len(temps)))
-
-	if stdDev == 0 {
-		stdDev = 0.01
-	}
-
-	latestData, _ := database.RedisClient.HGetAll(database.Ctx, fmt.Sprintf("device:%s", deviceID)).Result()
-	latestTemp, _ := strconv.ParseFloat(latestData["battery_temp"], 64)
-
-	zScore := (latestTemp - mean) / stdDev
-	status := "nominal"
-	if zScore > 2.5 {
-		status = "anomaly_detected"
-	}
+	result := AnalyzeTemperatureSeries(temps)
 
 	responsePayload := map[string]interface{}{
-		"device_id":         deviceID,
-		"rolling_mean_temp": math.Round(mean*100) / 100,
-		"current_temp":      latestTemp,
-		"computed_z_score":  math.Round(zScore*100) / 100,
-		"ml_classification": status,
+		"device_id":             deviceID,
+		"samples":               result.Samples,
+		"current_temp":          result.LatestTemp,
+		"baseline_mean_temp":    round2(result.BaselineMean),
+		"baseline_std_dev":      round2(result.BaselineStdDev),
+		"computed_z_score":      round2(result.ZScore),
+		"recent_median_z_score": round2(result.RecentMedianZScore),
+		"slope_per_reading":     round2(result.SlopePerReading),
+		"classification":        result.Classification,
 	}
 
 	resultBytes, _ := json.Marshal(responsePayload)
