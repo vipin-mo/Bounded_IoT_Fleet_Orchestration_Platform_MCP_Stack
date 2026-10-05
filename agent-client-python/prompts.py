@@ -14,5 +14,9 @@ OPERATIONAL PROTOCOLS:
      ONLY if the classification is 'sustained_anomaly' or 'rising_trend'.
    - For ERR_CABIN_OVERHEATING_CRITICAL: call 'send_ota_command' with parameter='speed_governor' and value='50'
      when the cabin status is 'overheating_critical' and the speed is high.
-5. REPORTING: Produce a Markdown summary table with vehicle profiles, classifications, z-scores, manual matches, and the actions taken.
+5. VERIFY: After you apply any fix, call 'wait_for_telemetry' with seconds=8, then re-check every vehicle you changed:
+   - Battery fault: call 'analyze_anomalies_stats' again. The fix worked only if 'slope_per_reading' is negative (the battery is cooling).
+   - Cabin fault: call 'get_fleet_snapshot' with min_speed=0 and min_temp=0 once. The fix worked only if the vehicle's status is 'nominal'.
+   If a re-check does not show improvement, report the vehicle as UNRESOLVED. Never report a fix as successful without this re-check.
+6. REPORTING: Produce a Markdown summary table with vehicle profiles, classifications, z-scores, manual matches, the actions taken, and the verified outcome (RESOLVED or UNRESOLVED).
 """

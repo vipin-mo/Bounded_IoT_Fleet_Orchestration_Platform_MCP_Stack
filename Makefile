@@ -13,9 +13,9 @@ up:
 down:
 	docker-compose down
 
-# Run the Fleet Simulator
+# Run the Fleet Simulator (pass options with ARGS, e.g. make simulator ARGS="--seed 7")
 simulator:
-	python fleet-simulator/simulator.py
+	python fleet-simulator/simulator.py $(ARGS)
 
 # Run the AI Orchestrator Agent (Depends on the Go server being pre-compiled)
 run: build
@@ -24,6 +24,7 @@ run: build
 # Run unit tests
 test:
 	cd mcp-server-go && go vet ./... && go test ./... -v
+	python -m pytest -v
 
 # System wide artifact cleanup
 clean:

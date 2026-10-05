@@ -34,12 +34,17 @@ type MaintenanceManualInput struct {
 	Query string `json:"query"`
 }
 
+type WaitInput struct {
+	Seconds float64 `json:"seconds"`
+}
+
 // Explicit structural outputs for type-safe SDK callback registration
 type FleetSnapshotOutput struct{}
 type SendOTACommandOutput struct{}
 type HistoricalLogsOutput struct{}
 type StatAnomalyOutput struct{}
 type MaintenanceManualOutput struct{}
+type WaitOutput struct{}
 
 // helperToSchema builds a single-property schema to prevent discovery parsing failures
 func helperToSchema(propName string, propType string, description string) map[string]interface{} {
@@ -151,7 +156,18 @@ func main() {
 		return res, MaintenanceManualOutput{}, err
 	})
 
-	// 8. Launch standard I/O communication server loop execution block
+	// 8. Register 'wait_for_telemetry'
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "wait_for_telemetry",
+		Description: "Pauses for a few seconds so new telemetry can arrive. Use it after applying a fix, before re-checking the vehicle. Maximum 15 seconds.",
+		InputSchema: helperToSchema("seconds", "number", "How many seconds to wait (1 to 15)"),
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input WaitInput) (*mcp.CallToolResult, WaitOutput, error) {
+		argsMap := map[string]interface{}{"seconds": input.Seconds}
+		res, err := server.HandleWaitForTelemetry(argsMap)
+		return res, WaitOutput{}, err
+	})
+
+	// 9. Launch standard I/O communication server loop execution block
 	log.Println("Starting Go MCP server via Stdio transport pipeline...")
 	if err := s.Run(ctx, &mcp.StdioTransport{}); err != nil {
 		log.Printf("Server execution context terminated unexpectedly: %v", err)

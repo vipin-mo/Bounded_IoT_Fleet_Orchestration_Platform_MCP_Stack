@@ -7,10 +7,19 @@ import (
 	"mcp-server-go/database"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/redis/go-redis/v9"
 )
+
+// DeviceSetKey is the Redis set that lists every vehicle ID (written by the simulator).
+const DeviceSetKey = "fleet:devices"
+
+// Longest pause the agent may ask for between a fix and its re-check.
+const maxWaitSeconds = 15.0
 
 // Structural schemas for arguments passed by the LLM Orchestrator
 type FleetSnapshotArgs struct {
@@ -50,22 +59,33 @@ func round2(x float64) float64 {
 	return math.Round(x*100) / 100
 }
 
-// HandleGetFleetSnapshot scans Redis hashes with structured validation protections
+// HandleGetFleetSnapshot returns the vehicles that match the speed and temperature filters.
+// It reads the device ID set and fetches all hashes in one pipelined round trip (no KEYS scan).
 func HandleGetFleetSnapshot(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
 	args := FleetSnapshotArgs{
 		MinSpeed: getFloat(arguments, "min_speed"),
 		MinTemp:  getFloat(arguments, "min_temp"),
 	}
 
-	var matchingDevices []map[string]interface{}
+	matchingDevices := []map[string]interface{}{}
 
-	keys, err := database.RedisClient.Keys(database.Ctx, "device:*").Result()
+	deviceIDs, err := database.RedisClient.SMembers(database.Ctx, DeviceSetKey).Result()
 	if err != nil {
 		return nil, err
 	}
+	sort.Strings(deviceIDs)
 
-	for _, key := range keys {
-		data, err := database.RedisClient.HGetAll(database.Ctx, key).Result()
+	pipe := database.RedisClient.Pipeline()
+	cmds := make([]*redis.MapStringStringCmd, len(deviceIDs))
+	for i, id := range deviceIDs {
+		cmds[i] = pipe.HGetAll(database.Ctx, "device:"+id)
+	}
+	if _, err := pipe.Exec(database.Ctx); err != nil && err != redis.Nil {
+		return nil, err
+	}
+
+	for _, cmd := range cmds {
+		data, err := cmd.Result()
 		if err != nil || len(data) == 0 {
 			continue
 		}
@@ -80,10 +100,12 @@ func HandleGetFleetSnapshot(arguments map[string]interface{}) (*mcp.CallToolResu
 
 		if speed >= args.MinSpeed && temp >= args.MinTemp {
 			matchingDevices = append(matchingDevices, map[string]interface{}{
-				"device_id":    data["device_id"],
-				"speed":        speed,
-				"battery_temp": temp,
-				"status":       data["cabin_status"],
+				"device_id":       data["device_id"],
+				"speed":           speed,
+				"battery_temp":    temp,
+				"status":          data["cabin_status"],
+				"power_parameter": data["power_parameter"],
+				"speed_governor":  data["speed_governor"],
 			})
 		}
 	}
@@ -93,6 +115,26 @@ func HandleGetFleetSnapshot(arguments map[string]interface{}) (*mcp.CallToolResu
 		Content: []mcp.Content{
 			&mcp.TextContent{
 				Text: string(resultBytes),
+			},
+		},
+	}, nil
+}
+
+// HandleWaitForTelemetry pauses so the agent can let new readings arrive before it re-checks a fix.
+func HandleWaitForTelemetry(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
+	seconds := getFloat(arguments, "seconds")
+	if seconds < 1 {
+		seconds = 1
+	}
+	if seconds > maxWaitSeconds {
+		seconds = maxWaitSeconds
+	}
+	time.Sleep(time.Duration(seconds * float64(time.Second)))
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.TextContent{
+				Text: fmt.Sprintf("Waited %.0f seconds. New telemetry has arrived.", seconds),
 			},
 		},
 	}, nil
