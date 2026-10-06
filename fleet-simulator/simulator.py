@@ -47,6 +47,7 @@ def write_tick(r, states, timestamp):
             "speed": str(state["speed"]),
             "battery_temp": str(state["battery_temp"]),
             "cabin_status": state["cabin_status"],
+            "updated_at": str(timestamp),
         })
         pipe.sadd(DEVICE_SET_KEY, device_id)
         pipe.lpush(f"logs:{device_id}", json.dumps({

@@ -34,6 +34,8 @@ type MaintenanceManualInput struct {
 	Query string `json:"query"`
 }
 
+type ScanFleetInput struct{}
+
 type WaitInput struct {
 	Seconds float64 `json:"seconds"`
 }
@@ -45,6 +47,7 @@ type HistoricalLogsOutput struct{}
 type StatAnomalyOutput struct{}
 type MaintenanceManualOutput struct{}
 type WaitOutput struct{}
+type ScanFleetOutput struct{}
 
 // helperToSchema builds a single-property schema to prevent discovery parsing failures
 func helperToSchema(propName string, propType string, description string) map[string]interface{} {
@@ -156,7 +159,22 @@ func main() {
 		return res, MaintenanceManualOutput{}, err
 	})
 
-	// 8. Register 'wait_for_telemetry'
+	// 8. Register 'scan_fleet'
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "scan_fleet",
+		Description: "Checks EVERY vehicle on the server (battery trend, cabin status, data freshness) and returns only " +
+			"the vehicles that need action, plus a feed_status of ok, stale or empty. Call this first and again after " +
+			"each fix. If feed_status is not ok, the telemetry feed is down: report it and take no action.",
+		InputSchema: map[string]interface{}{
+			"type":       "object",
+			"properties": map[string]interface{}{},
+		},
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input ScanFleetInput) (*mcp.CallToolResult, ScanFleetOutput, error) {
+		res, err := server.HandleScanFleet(map[string]interface{}{})
+		return res, ScanFleetOutput{}, err
+	})
+
+	// 9. Register 'wait_for_telemetry'
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "wait_for_telemetry",
 		Description: "Pauses for a few seconds so new telemetry can arrive. Use it after applying a fix, before re-checking the vehicle. Maximum 15 seconds.",
@@ -167,7 +185,7 @@ func main() {
 		return res, WaitOutput{}, err
 	})
 
-	// 9. Launch standard I/O communication server loop execution block
+	// 10. Launch standard I/O communication server loop execution block
 	log.Println("Starting Go MCP server via Stdio transport pipeline...")
 	if err := s.Run(ctx, &mcp.StdioTransport{}); err != nil {
 		log.Printf("Server execution context terminated unexpectedly: %v", err)
