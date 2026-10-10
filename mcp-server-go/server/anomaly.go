@@ -54,9 +54,12 @@ type AnomalyResult struct {
 // Rules, checked in this order:
 //  1. sustained_anomaly: the median of the recent readings is above the threshold (or above the
 //     absolute limit). One odd reading cannot move a median, so this means the heating is real.
-//  2. transient_spike: the newest reading is above the threshold but the one before it was not.
-//  3. rising_trend: the newest reading is above the threshold after a high reading, or the recent
-//     slope exceeds RisingSlopeLimit.
+//  2. transient_spike: the newest reading is above the threshold, the one before it was not, AND
+//     the recent slope is flat. The slope test matters: when a slow ramp has already pulled the
+//     baseline up, the first reading to cross the threshold looks like a spike, but a ramp has a
+//     steady positive slope and a lone spike does not (the slope is robust to one stray reading).
+//  3. rising_trend: the newest reading is above the threshold without being a lone spike, or the
+//     recent slope exceeds RisingSlopeLimit.
 //  4. nominal: everything else, including cooling after a mitigation.
 func AnalyzeTemperatureSeries(temps []float64) AnomalyResult {
 	n := len(temps)
@@ -88,7 +91,7 @@ func AnalyzeTemperatureSeries(temps []float64) AnomalyResult {
 	switch {
 	case res.RecentMedianZScore > ZScoreThreshold || recentMedian >= AbsoluteTempLimit:
 		res.Classification = ClassSustainedAnomaly
-	case res.ZScore > ZScoreThreshold && previousZ <= ZScoreThreshold:
+	case res.ZScore > ZScoreThreshold && previousZ <= ZScoreThreshold && res.SlopePerReading <= RisingSlopeLimit:
 		res.Classification = ClassTransientSpike
 	case res.ZScore > ZScoreThreshold || res.SlopePerReading > RisingSlopeLimit:
 		res.Classification = ClassRisingTrend

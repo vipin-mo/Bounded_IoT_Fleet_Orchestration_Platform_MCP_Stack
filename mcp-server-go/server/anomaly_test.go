@@ -77,6 +77,17 @@ func TestAnalyzeTemperatureSeriesClassification(t *testing.T) {
 	}
 }
 
+func TestRampWithContaminatedBaselineIsNotASpike(t *testing.T) {
+	for _, rampReadings := range []int{33, 34, 35, 36} {
+		temps := join(flatSeries(20, 30), rampTail(30, 0.6, rampReadings))
+		got := AnalyzeTemperatureSeries(temps)
+		if got.Classification == ClassTransientSpike || got.Classification == ClassNominal {
+			t.Fatalf("ramp of %d readings classified %q (z=%.2f slope=%.3f), want rising_trend or sustained_anomaly",
+				rampReadings, got.Classification, got.ZScore, got.SlopePerReading)
+		}
+	}
+}
+
 // The newest readings must not be part of their own baseline. If they were, a real jump would
 // drag the mean and standard deviation up with it and hide itself.
 func TestBaselineExcludesRecentReadings(t *testing.T) {

@@ -1,0 +1,38 @@
+[
+  {"name": "eco_mode on a valid car", "device_id": "car_000", "parameter": "power_parameter", "value": "eco_mode", "valid": true},
+  {"name": "governor 50", "device_id": "car_012", "parameter": "speed_governor", "value": "50", "valid": true},
+  {"name": "governor lower bound 20", "device_id": "car_012", "parameter": "speed_governor", "value": "20", "valid": true},
+  {"name": "governor upper bound 60", "device_id": "car_099", "parameter": "speed_governor", "value": "60", "valid": true},
+  {"name": "governor with leading zero", "device_id": "car_012", "parameter": "speed_governor", "value": "050", "valid": true},
+
+  {"name": "governor just below range", "device_id": "car_012", "parameter": "speed_governor", "value": "19", "valid": false},
+  {"name": "governor just above range", "device_id": "car_012", "parameter": "speed_governor", "value": "61", "valid": false},
+  {"name": "governor zero", "device_id": "car_012", "parameter": "speed_governor", "value": "0", "valid": false},
+  {"name": "governor four digits", "device_id": "car_012", "parameter": "speed_governor", "value": "0050", "valid": false},
+  {"name": "governor text", "device_id": "car_012", "parameter": "speed_governor", "value": "abc", "valid": false},
+  {"name": "governor with inner space", "device_id": "car_012", "parameter": "speed_governor", "value": "5 0", "valid": false},
+  {"name": "governor leading space", "device_id": "car_012", "parameter": "speed_governor", "value": " 50", "valid": false},
+  {"name": "governor trailing newline", "device_id": "car_012", "parameter": "speed_governor", "value": "50\n", "valid": false},
+  {"name": "governor negative", "device_id": "car_012", "parameter": "speed_governor", "value": "-50", "valid": false},
+  {"name": "governor plus sign", "device_id": "car_012", "parameter": "speed_governor", "value": "+50", "valid": false},
+  {"name": "governor decimal", "device_id": "car_012", "parameter": "speed_governor", "value": "50.0", "valid": false},
+  {"name": "governor superscript two (str.isdigit is true, int() fails)", "device_id": "car_012", "parameter": "speed_governor", "value": "²", "valid": false},
+  {"name": "governor arabic-indic digits", "device_id": "car_012", "parameter": "speed_governor", "value": "٥٠", "valid": false},
+
+  {"name": "power mode turbo", "device_id": "car_012", "parameter": "power_parameter", "value": "turbo", "valid": false},
+  {"name": "power mode wrong case", "device_id": "car_012", "parameter": "power_parameter", "value": "ECO_MODE", "valid": false},
+  {"name": "power mode empty", "device_id": "car_012", "parameter": "power_parameter", "value": "", "valid": false},
+
+  {"name": "protected register battery_temp", "device_id": "car_012", "parameter": "battery_temp", "value": "10", "valid": false},
+  {"name": "protected register cabin_status", "device_id": "car_012", "parameter": "cabin_status", "value": "nominal", "valid": false},
+  {"name": "empty parameter", "device_id": "car_012", "parameter": "", "value": "50", "valid": false},
+
+  {"name": "device id too short", "device_id": "car_12", "parameter": "speed_governor", "value": "50", "valid": false},
+  {"name": "device id too long", "device_id": "car_1234", "parameter": "speed_governor", "value": "50", "valid": false},
+  {"name": "device id upper case", "device_id": "CAR_012", "parameter": "speed_governor", "value": "50", "valid": false},
+  {"name": "device id trailing newline (Python $ matches before it)", "device_id": "car_012\n", "parameter": "speed_governor", "value": "50", "valid": false},
+  {"name": "device id trailing space", "device_id": "car_012 ", "parameter": "speed_governor", "value": "50", "valid": false},
+  {"name": "device id full-width digits", "device_id": "car_０１２", "parameter": "speed_governor", "value": "50", "valid": false},
+  {"name": "device id path traversal", "device_id": "../car_012", "parameter": "speed_governor", "value": "50", "valid": false},
+  {"name": "device id empty", "device_id": "", "parameter": "speed_governor", "value": "50", "valid": false}
+]

@@ -55,6 +55,20 @@ func getString(m map[string]interface{}, key string) string {
 	return ""
 }
 
+// ageSeconds is how old a vehicle's last telemetry write is. It returns -1 when the vehicle has no
+// timestamp, so the agent can tell a stopped feed from a healthy fleet.
+func ageSeconds(updatedAt string) int64 {
+	written, err := strconv.ParseInt(updatedAt, 10, 64)
+	if err != nil {
+		return -1
+	}
+	age := time.Now().Unix() - written
+	if age < 0 {
+		return 0
+	}
+	return age
+}
+
 func round2(x float64) float64 {
 	return math.Round(x*100) / 100
 }
@@ -106,6 +120,7 @@ func HandleGetFleetSnapshot(arguments map[string]interface{}) (*mcp.CallToolResu
 				"status":          data["cabin_status"],
 				"power_parameter": data["power_parameter"],
 				"speed_governor":  data["speed_governor"],
+				"age_seconds":     ageSeconds(data["updated_at"]),
 			})
 		}
 	}
@@ -116,6 +131,58 @@ func HandleGetFleetSnapshot(arguments map[string]interface{}) (*mcp.CallToolResu
 			&mcp.TextContent{
 				Text: string(resultBytes),
 			},
+		},
+	}, nil
+}
+
+// HandleScanFleet checks every vehicle on the server and returns only the ones that need action.
+// The agent no longer decides which cars to look at, so a battery that is warming but still under
+// some pre-filter cannot be skipped. One round trip reads all vehicle hashes and all histories.
+func HandleScanFleet(arguments map[string]interface{}) (*mcp.CallToolResult, error) {
+	deviceIDs, err := database.RedisClient.SMembers(database.Ctx, DeviceSetKey).Result()
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(deviceIDs)
+
+	pipe := database.RedisClient.Pipeline()
+	hashes := make([]*redis.MapStringStringCmd, len(deviceIDs))
+	logs := make([]*redis.StringSliceCmd, len(deviceIDs))
+	for i, id := range deviceIDs {
+		hashes[i] = pipe.HGetAll(database.Ctx, "device:"+id)
+		logs[i] = pipe.LRange(database.Ctx, "logs:"+id, 0, HistoryWindow-1)
+	}
+	if _, err := pipe.Exec(database.Ctx); err != nil && err != redis.Nil {
+		return nil, err
+	}
+
+	readings := make([]DeviceReading, 0, len(deviceIDs))
+	for i, id := range deviceIDs {
+		data, err := hashes[i].Result()
+		if err != nil || len(data) == 0 {
+			// Listed in the set but the hash is gone (expired or wiped): treat as stale, never as healthy.
+			readings = append(readings, DeviceReading{DeviceID: id, AgeSeconds: -1})
+			continue
+		}
+		speed, _ := strconv.ParseFloat(data["speed"], 64)
+		temp, _ := strconv.ParseFloat(data["battery_temp"], 64)
+		history, _ := logs[i].Result()
+		readings = append(readings, DeviceReading{
+			DeviceID:       id,
+			Speed:          speed,
+			BatteryTemp:    temp,
+			CabinStatus:    data["cabin_status"],
+			PowerParameter: data["power_parameter"],
+			SpeedGovernor:  data["speed_governor"],
+			AgeSeconds:     ageSeconds(data["updated_at"]),
+			Temps:          TempsFromLogs(history),
+		})
+	}
+
+	resultBytes, _ := json.Marshal(BuildScanReport(readings))
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.TextContent{Text: string(resultBytes)},
 		},
 	}, nil
 }
@@ -148,6 +215,17 @@ func HandleSendOTACommand(arguments map[string]interface{}) (*mcp.CallToolResult
 		Value:     getString(arguments, "value"),
 	}
 
+	if err := ValidateOTACommand(args.DeviceID, args.Parameter, args.Value); err != nil {
+		return &mcp.CallToolResult{
+			IsError: true,
+			Content: []mcp.Content{
+				&mcp.TextContent{
+					Text: fmt.Sprintf("Rejected by server-side validation: %v", err),
+				},
+			},
+		}, nil
+	}
+
 	redisKey := fmt.Sprintf("device:%s", args.DeviceID)
 
 	exists, _ := database.RedisClient.Exists(database.Ctx, redisKey).Result()
@@ -156,6 +234,19 @@ func HandleSendOTACommand(arguments map[string]interface{}) (*mcp.CallToolResult
 			Content: []mcp.Content{
 				&mcp.TextContent{
 					Text: fmt.Sprintf("Failure: Device %s not found in fleet registry map", args.DeviceID),
+				},
+			},
+		}, nil
+	}
+
+	// Never change settings on data we cannot trust.
+	updatedAt, _ := database.RedisClient.HGet(database.Ctx, redisKey, "updated_at").Result()
+	if err := CheckFreshForWrite(ageSeconds(updatedAt)); err != nil {
+		return &mcp.CallToolResult{
+			IsError: true,
+			Content: []mcp.Content{
+				&mcp.TextContent{
+					Text: fmt.Sprintf("Rejected: %v. Report STALE TELEMETRY instead of acting.", err),
 				},
 			},
 		}, nil
@@ -216,17 +307,7 @@ func HandleStatAnomalyAnalysis(arguments map[string]interface{}) (*mcp.CallToolR
 		return nil, err
 	}
 
-	// Redis returns the newest entry first (LPUSH). Walk backwards to get oldest -> newest.
-	temps := make([]float64, 0, len(logs))
-	for i := len(logs) - 1; i >= 0; i-- {
-		var entry struct {
-			BatteryTemp float64 `json:"battery_temp"`
-		}
-		if err := json.Unmarshal([]byte(logs[i]), &entry); err != nil {
-			continue
-		}
-		temps = append(temps, entry.BatteryTemp)
-	}
+	temps := TempsFromLogs(logs)
 
 	result := AnalyzeTemperatureSeries(temps)
 

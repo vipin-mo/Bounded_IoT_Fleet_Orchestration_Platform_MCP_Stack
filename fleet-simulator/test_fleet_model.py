@@ -118,6 +118,7 @@ def test_write_tick_keeps_history_window_and_registers_devices(redis_client):
     assert newest["timestamp"] == 1_700_000_000 + simulator.HISTORY_WINDOW + 24
     assert redis_client.smembers(simulator.DEVICE_SET_KEY) == set(model.device_ids)
     assert redis_client.hget("device:car_003", "cabin_status") == "nominal"
+    assert redis_client.hget("device:car_003", "updated_at") == str(1_700_000_000 + simulator.HISTORY_WINDOW + 24)
 
 
 def test_agent_registers_survive_telemetry_writes_and_are_read_back(redis_client):
