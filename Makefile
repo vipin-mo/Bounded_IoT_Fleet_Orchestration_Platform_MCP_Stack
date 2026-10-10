@@ -1,4 +1,4 @@
-.PHONY: build run simulator up down clean clean-logs
+.PHONY: build run simulator up down clean clean-logs test
 
 # Default task to build the native cross-platform Go binary
 build:
@@ -20,6 +20,10 @@ simulator:
 # Run the AI Orchestrator Agent (Depends on the Go server being pre-compiled)
 run: build
 	python agent-client-python/main.py
+
+# Run unit tests
+test:
+	cd mcp-server-go && go vet ./... && go test ./... -v
 
 # System wide artifact cleanup
 clean:

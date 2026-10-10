@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: mcp-server-go/go.mod
+          cache-dependency-path: mcp-server-go/go.sum
+      - name: Vet
+        run: go vet ./...
+        working-directory: mcp-server-go
+      - name: Test
+        run: go test ./... -v
+        working-directory: mcp-server-go

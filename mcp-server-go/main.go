@@ -26,7 +26,7 @@ type HistoricalLogsInput struct {
 	DeviceID string `json:"device_id"`
 }
 
-type MLAnomalyInput struct {
+type StatAnomalyInput struct {
 	DeviceID string `json:"device_id"`
 }
 
@@ -38,7 +38,7 @@ type MaintenanceManualInput struct {
 type FleetSnapshotOutput struct{}
 type SendOTACommandOutput struct{}
 type HistoricalLogsOutput struct{}
-type MLAnomalyOutput struct{}
+type StatAnomalyOutput struct{}
 type MaintenanceManualOutput struct{}
 
 // helperToSchema builds a single-property schema to prevent discovery parsing failures
@@ -102,7 +102,7 @@ func main() {
 			"properties": map[string]interface{}{
 				"device_id": map[string]interface{}{"type": "string", "description": "Target unique vehicle identifier (e.g. car_012)"},
 				"parameter": map[string]interface{}{"type": "string", "description": "The target state parameter register to mutate ('power_parameter' or 'speed_governor')"},
-				"value":     map[string]interface{}{"type": "string", "description": "The configuration configuration target value string (e.g., 'eco_mode' or '50')"},
+				"value":     map[string]interface{}{"type": "string", "description": "The configuration target value string (e.g., 'eco_mode' or '50')"},
 			},
 			"required": []string{"device_id", "parameter", "value"},
 		},
@@ -127,15 +127,17 @@ func main() {
 		return res, HistoricalLogsOutput{}, err
 	})
 
-	// 6. Register 'analyze_anomalies_ml'
+	// 6. Register 'analyze_anomalies_stats'
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "analyze_anomalies_ml",
-		Description: "Calculates rolling window Z-Score statistical metrics over target vehicle data streams to classify anomalies.",
+		Name: "analyze_anomalies_stats",
+		Description: "Compares a vehicle's newest battery temperature readings with its own earlier baseline " +
+			"(z-score and trend). Returns a classification: sustained_anomaly, rising_trend, transient_spike, " +
+			"nominal or insufficient_data.",
 		InputSchema: helperToSchema("device_id", "string", "Target unique vehicle identifier for anomaly verification"),
-	}, func(ctx context.Context, req *mcp.CallToolRequest, input MLAnomalyInput) (*mcp.CallToolResult, MLAnomalyOutput, error) {
+	}, func(ctx context.Context, req *mcp.CallToolRequest, input StatAnomalyInput) (*mcp.CallToolResult, StatAnomalyOutput, error) {
 		argsMap := map[string]interface{}{"device_id": input.DeviceID}
-		res, err := server.HandleMLAnomalyAnalysis(argsMap)
-		return res, MLAnomalyOutput{}, err
+		res, err := server.HandleStatAnomalyAnalysis(argsMap)
+		return res, StatAnomalyOutput{}, err
 	})
 
 	// 7. Register 'search_maintenance_manual'
