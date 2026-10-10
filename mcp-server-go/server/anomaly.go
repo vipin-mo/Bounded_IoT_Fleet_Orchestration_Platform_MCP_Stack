@@ -54,10 +54,11 @@ type AnomalyResult struct {
 // Rules, checked in this order:
 //  1. sustained_anomaly: the median of the recent readings is above the threshold (or above the
 //     absolute limit). One odd reading cannot move a median, so this means the heating is real.
-//  2. transient_spike: the newest reading is above the threshold, the one before it was not, AND
-//     the recent slope is flat. The slope test matters: when a slow ramp has already pulled the
-//     baseline up, the first reading to cross the threshold looks like a spike, but a ramp has a
-//     steady positive slope and a lone spike does not (the slope is robust to one stray reading).
+//  2. transient_spike: the newest reading is above the threshold, the one before it was not, AND the
+//     readings before the newest were not climbing. The slope test matters: when a slow ramp has
+//     already pulled the baseline up, the first reading to cross the threshold looks like a spike, but
+//     a ramp was already rising and a lone spike was not. The slope leaves out the newest reading so
+//     the spike itself cannot tilt it.
 //  3. rising_trend: the newest reading is above the threshold without being a lone spike, or the
 //     recent slope exceeds RisingSlopeLimit.
 //  4. nominal: everything else, including cooling after a mitigation.
@@ -87,11 +88,17 @@ func AnalyzeTemperatureSeries(temps []float64) AnomalyResult {
 	res.ZScore = (res.LatestTemp - mean) / std
 	res.RecentMedianZScore = (recentMedian - mean) / std
 	res.SlopePerReading = slopePerReading(recent)
+	// Was the temperature already climbing BEFORE the newest reading? This is what tells a lone spike (no
+	// earlier climb) from the first reading of a ramp (earlier readings already rising). It must not
+	// include the newest reading: with a spike as the newest point, 4 of the 10 pairwise slopes are the
+	// spike itself and sensor noise on the other six can push the median over the limit (seen in 5 of 70
+	// simulated blips). The four earlier readings carry only noise.
+	priorSlope := slopePerReading(recent[:RecentCount-1])
 
 	switch {
 	case res.RecentMedianZScore > ZScoreThreshold || recentMedian >= AbsoluteTempLimit:
 		res.Classification = ClassSustainedAnomaly
-	case res.ZScore > ZScoreThreshold && previousZ <= ZScoreThreshold && res.SlopePerReading <= RisingSlopeLimit:
+	case res.ZScore > ZScoreThreshold && previousZ <= ZScoreThreshold && priorSlope <= RisingSlopeLimit:
 		res.Classification = ClassTransientSpike
 	case res.ZScore > ZScoreThreshold || res.SlopePerReading > RisingSlopeLimit:
 		res.Classification = ClassRisingTrend

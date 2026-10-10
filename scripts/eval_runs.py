@@ -5,6 +5,8 @@ Each case: start the simulator with a new seed and layout, wait for the faults t
 agent once, stop the simulator, score the run against the simulator's ground truth.
 
     python scripts/eval_runs.py --runs 20                 # about 20 minutes, a few dollars of API use
+    python scripts/eval_runs.py --runs 12 --suite hard    # harder cases: dual faults, silent faulty cars, slow ramps
+    python scripts/eval_runs.py --runs 20 --agent baseline   # the rule-based agent: same cases, no API key, no cost
     python scripts/eval_runs.py --runs 3 --seed-base 500  # quick check
     python scripts/eval_runs.py --score-ledger logs/fleet_agent_ledger_2026-10-06.jsonl \\
         --expect default --session-start 2026-10-06T18:37     # score runs you already made
@@ -13,6 +15,7 @@ Results go to eval_results/<timestamp>/ (summary.md, results.jsonl, and one fold
 simulator log, agent output, ledger slice and ground truth). Copy summary.md into the README.
 """
 import argparse
+import functools
 import json
 import os
 import subprocess
@@ -27,10 +30,16 @@ from eval_scoring import (aggregate, default_manifest, parse_ledger, render_summ
 
 ROOT = Path(__file__).resolve().parent.parent
 BINARY = ROOT / "mcp-server-go" / "mcp-server-go-binary"
+AGENT_SCRIPTS = {"llm": ROOT / "agent-client-python" / "main.py",
+                 "baseline": ROOT / "agent-client-python" / "baseline_agent.py"}
 
 # One round of the suite. Mostly random fault layouts, plus the controls that catch false alarms.
 SUITE_PATTERN = ["random", "random", "none", "random", "spikes_only",
                  "random", "silent", "random", "freeze", "random"]
+# Harder cases (--suite hard). Each kind is one fault type the standard suite never uses.
+HARD_PATTERN = ["dual", "silent_fault", "slow_ramp"]
+SLOW_RAMP_HEAT = 0.15             # degrees C per second: the detector needs 8 to 11 s to see it (docs/DETECTION_LATENCY.md)
+SLOW_RAMP_LEAD_SECONDS = 25       # long enough that even the slowest measured detection has happened
 FAULT_STARTS = [20, 30, 40, 50]   # the detector needs about 15 readings of history before faults
 STALE_GAP_SECONDS = 20            # how long the feed is dead before the agent starts (limit is 15 s)
 SILENT_CARS = 5
@@ -38,17 +47,22 @@ SILENT_MIN_AGE_SECONDS = 25       # silent cars must be clearly older than the 1
 FREEZE_AFTER_FAULT_START = 15     # ticks of faults written before the feed dies
 
 
-def build_suite(runs, seed_base):
+def build_suite(runs, seed_base, suite="standard"):
     """Return the list of cases. The same arguments always give the same suite."""
+    pattern = HARD_PATTERN if suite == "hard" else SUITE_PATTERN
     cases = []
     for i in range(runs):
-        kind = SUITE_PATTERN[i % len(SUITE_PATTERN)]
+        kind = pattern[i % len(pattern)]
         fault_start = FAULT_STARTS[i % len(FAULT_STARTS)]
-        case = {"index": i + 1, "kind": kind, "seed": seed_base + i * 11, "fault_start": fault_start,
-                "profile": {"silent": "random", "freeze": "random"}.get(kind, kind),
-                "silent_cars": SILENT_CARS if kind == "silent" else 0,
-                "freeze_after": fault_start + FREEZE_AFTER_FAULT_START if kind == "freeze" else None}
-        cases.append(case)
+        profile = {"silent": "random", "freeze": "random", "dual": "dual", "silent_fault": "dual",
+                   "slow_ramp": "battery_only"}.get(kind, kind)
+        cases.append({
+            "index": i + 1, "kind": kind, "seed": seed_base + i * 11, "fault_start": fault_start, "profile": profile,
+            "silent_cars": SILENT_CARS if kind == "silent" else 0,
+            "silent_faulty": 1 if kind == "silent_fault" else 0,
+            "heat_per_tick": SLOW_RAMP_HEAT if kind == "slow_ramp" else None,
+            "freeze_after": fault_start + FREEZE_AFTER_FAULT_START if kind == "freeze" else None,
+        })
     return cases
 
 
@@ -56,9 +70,11 @@ def wait_seconds(case, lead):
     """How long to let the simulator run before the agent starts."""
     if case["freeze_after"] is not None:
         return case["freeze_after"] + STALE_GAP_SECONDS
-    if case["silent_cars"]:
+    if case["silent_cars"] or case.get("silent_faulty"):
         # silent cars must be older than the 15 s freshness limit when the agent scans
         return case["fault_start"] + max(lead, SILENT_MIN_AGE_SECONDS)
+    if case.get("heat_per_tick"):
+        return case["fault_start"] + max(lead, SLOW_RAMP_LEAD_SECONDS)
     return case["fault_start"] + lead
 
 
@@ -68,6 +84,10 @@ def simulator_command(case, manifest_path):
            "--profile", case["profile"], "--manifest", str(manifest_path)]
     if case["silent_cars"]:
         cmd += ["--silent-cars", str(case["silent_cars"])]
+    if case.get("silent_faulty"):
+        cmd += ["--silent-faulty", str(case["silent_faulty"])]
+    if case.get("heat_per_tick"):
+        cmd += ["--heat-per-tick", str(case["heat_per_tick"])]
     if case["freeze_after"] is not None:
         cmd += ["--freeze-after", str(case["freeze_after"])]
     return cmd
@@ -112,13 +132,14 @@ def stop_simulator(proc):
         proc.kill()
 
 
-def run_agent(case_dir, timeout):
-    """Run the agent once. Returns (return code, ledger text written during the run)."""
+def run_agent(case_dir, timeout, name="llm"):
+    """Run the agent once. `name` is "llm" (Claude, needs an API key) or "baseline" (rules, free).
+    Returns (return code, ledger text written during the run)."""
     path = ledger_path()
     offset = path.stat().st_size if path.exists() else 0
     with open(case_dir / "agent.log", "w", encoding="utf-8") as out:
         try:
-            proc = subprocess.run([sys.executable, str(ROOT / "agent-client-python" / "main.py")],
+            proc = subprocess.run([sys.executable, str(AGENT_SCRIPTS[name])],
                                   cwd=ROOT, stdout=out, stderr=subprocess.STDOUT, timeout=timeout)
             code = proc.returncode
         except subprocess.TimeoutExpired:
@@ -148,7 +169,8 @@ def score_case(case, manifest, ledger_text, return_code):
         return {**base, "error": f"agent crashed: {error[:300]}; see agent.log"}
     result = score_session(manifest, summary)
     result.update(base)
-    result["manifest"] = {k: manifest.get(k) for k in ("battery", "cabin", "spikes", "silent", "freeze_after")}
+    result["manifest"] = {k: manifest.get(k) for k in
+                          ("battery", "cabin", "dual", "spikes", "silent", "silent_faulty", "heat_per_tick", "freeze_after")}
     return result
 
 
@@ -207,8 +229,14 @@ def parse_args(argv=None):
     p.add_argument("--max-invalid-streak", type=int, default=3,
                    help="stop the suite after this many invalid cases in a row (a setup problem repeats "
                         "every time; there is no point in waiting 20 minutes to learn that)")
+    p.add_argument("--suite", choices=["standard", "hard"], default="standard",
+                   help="standard: random faults and controls. hard: dual-fault cars, faulty cars that go "
+                        "silent, slow ramps")
+    p.add_argument("--agent", choices=["llm", "baseline"], default="llm",
+                   help="llm: the Claude agent (API key, costs money). baseline: the rule-based agent "
+                        "(no key, free), run on the same cases")
     p.add_argument("--only", help="comma-separated case kinds to keep from the suite "
-                                  "(random, none, spikes_only, silent, freeze), e.g. --only freeze,silent")
+                                  "(standard: random, none, spikes_only, silent, freeze; hard: dual, silent_fault, slow_ramp)")
     p.add_argument("--out", default=str(ROOT / "eval_results"))
     p.add_argument("--score-ledger", help="score sessions from an existing ledger instead of running")
     p.add_argument("--expect", choices=["default", "none", "stale"], default="default",
@@ -231,7 +259,7 @@ def main(argv=None):
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = Path(args.out) / stamp
     out_dir.mkdir(parents=True, exist_ok=True)
-    cases = build_suite(args.runs, args.seed_base)
+    cases = build_suite(args.runs, args.seed_base, args.suite)
     if args.only:
         wanted = {k.strip() for k in args.only.split(",")}
         cases = [c for c in cases if c["kind"] in wanted]
@@ -245,11 +273,13 @@ def main(argv=None):
     for position, case in enumerate(cases, 1):
         label = f"[{position}/{len(cases)}] {case['kind']} seed={case['seed']} fault_start={case['fault_start']}"
         print(label, flush=True)
-        result = run_case(case, out_dir / f"case_{case['index']:02d}_{case['kind']}", args.lead, args.agent_timeout)
+        result = run_case(case, out_dir / f"case_{case['index']:02d}_{case['kind']}", args.lead, args.agent_timeout,
+                          agent=functools.partial(run_agent, name=args.agent))
+        result["agent"] = args.agent
         results.append(result)
         verdict = "INVALID: " + result["error"] if result.get("error") else ("PASS" if result["passed"] else "FAIL: " + "; ".join(result["reasons"]))
         print("   ->", verdict, flush=True)
-        write_results(out_dir, results, "Agent evaluation (in progress)")
+        write_results(out_dir, results, f"Agent evaluation: {args.agent}, {args.suite} suite (in progress)")
         invalid_streak = invalid_streak + 1 if result.get("error") else 0
         if invalid_streak >= args.max_invalid_streak:
             print(f"\nStopping: {invalid_streak} invalid cases in a row. Fix the problem below, then rerun.")
@@ -257,7 +287,7 @@ def main(argv=None):
             break
 
     print()
-    print(write_results(out_dir, results, "Agent evaluation"))
+    print(write_results(out_dir, results, f"Agent evaluation: {args.agent}, {args.suite} suite"))
     return 0
 
 

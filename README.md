@@ -1,184 +1,195 @@
-# Fleet Orchestration with an MCP Agent
+# Fleet MCP Platform
 
-[![CI](https://github.com/vipin-mo/Bounded_IoT_Fleet_Orchestration_Platform_MCP_Stack/actions/workflows/ci.yml/badge.svg)](https://github.com/vipin-mo/Bounded_IoT_Fleet_Orchestration_Platform_MCP_Stack/actions/workflows/ci.yml)
+[![CI](https://github.com/vipin-mo/fleet-mcp-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/vipin-mo/fleet-mcp-platform/actions/workflows/ci.yml)
 
-A Claude agent watches a **simulated** 100-vehicle telemetry stream, finds battery and cabin faults,
-applies a (simulated) over-the-air fix, and then checks that the fix worked. The agent talks to the
-fleet through a Go server that speaks the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
+A Claude agent watches a **simulated** 100-vehicle telemetry stream, finds battery and cabin faults, applies
+a (simulated) over-the-air fix, and checks that the fix worked. It talks to the fleet through a Go server
+that speaks the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). A seeded fault simulator
+and a ground-truth scoring script measure how often it gets this right.
 
-This is a portfolio project, not production software. The fleet is a Python simulator, "OTA" means
-writing a field in a Redis hash, and Redis is a single container.
+**Result:** on 20 randomized fleets the agent fixed 43 of 43 injected faults and made no write to a healthy
+vehicle (20 of 20 runs passed, 95% interval 84% to 100%). A rule-based agent with no model passes the same
+cases, 20 seconds faster and with no tokens, so these cases test the safety layers and the detector, not the
+model. See [Results](#results) and [Claude versus rules](#claude-versus-a-rule-based-agent).
+
+This is a portfolio project, not production software. The fleet is a Python simulator, "OTA" means writing
+a field in a Redis hash, and Redis is a single container.
 
 ## How it fits together
 
 ```mermaid
 graph LR
     Sim["Fleet simulator (Python, 1 reading/s per car)"] -->|telemetry| Redis[("Redis")]
-    Redis -->|"registers the agent wrote: power_parameter, speed_governor"| Sim
-    Agent["Agent (Python, Claude Haiku 4.5)"] -->|"MCP over stdio"| Go["Go MCP server"]
+    Redis -->|"registers the agent wrote"| Sim
+    Agent["Agent (Python, Claude Haiku 4.5)"] -->|"MCP over stdio"| Go["Go MCP server: scan_fleet, send_ota_command, ..."]
     Go <-->|read and write| Redis
-    Agent -.->|"layer 1: guardrails.py"| Check1{{"Safe OTA write?"}}
-    Go -.->|"layer 2: validate.go"| Check2{{"Safe OTA write?"}}
+    Agent -.->|"write check 1: guardrails.py"| Check1{{"Safe write?"}}
+    Go -.->|"write check 2: validate.go, freshness check"| Check2{{"Safe write?"}}
 ```
 
-The simulator reacts to the registers the agent writes, so a fix really changes the data and the
-agent can verify it.
+The simulator reacts to the registers the agent writes, so a fix really changes the data and the agent can
+verify it. The agent's loop: scan the whole fleet, look up the cause in the maintenance manual, write the
+approved fix for each flagged vehicle, wait 8 s, scan again, and report each vehicle as RESOLVED or UNRESOLVED.
 
-## Scenarios (fault cars are fixed, faults start 60 s in)
+## Safety
 
-| Cars | Scenario | Correct agent action |
-| --- | --- | --- |
-| `car_012`, `car_035` | Battery heats about 0.6 °C per second | `power_parameter = eco_mode`, then confirm the battery is cooling |
-| `car_068`, `car_088` | Cabin `overheating_critical` and speeding | `speed_governor = 50`, then confirm the status is `nominal` |
-| `car_020`, `car_050` | One hot reading every 20 s (sensor blip) | Do nothing |
-| everyone else | Healthy | Do nothing |
+The model can produce bad tool calls and the feed can go quiet, so the checks do not depend on the prompt.
 
-### Test layouts
+**Write validation, two layers.** `agent-client-python/guardrails.py` runs before a call leaves the agent;
+`mcp-server-go/server/validate.go` runs again inside the server. Rules: device ID `car_` plus three ASCII
+digits; `power_parameter` accepts only `eco_mode`; `speed_governor` accepts a whole number from 20 to 60;
+every other register is rejected. Both layers pass the same 32 cases in `testdata/ota_cases.json`.
+`python scripts/bad_ota_demo.py` shows the server rejecting unsafe calls on its own.
 
-`--profile` chooses which cars are faulty, so a result is not tied to four hard-coded car numbers:
+**Stale data, three layers.** A stopped feed must not look like a healthy fleet.
 
-| Profile | Cars |
-| --- | --- |
-| `default` | The original fixed cars (table above) |
-| `random` | A new layout for every seed: 0 to 3 battery faults, 0 to 3 cabin faults, 0 to 3 sensor blips, at least one real fault |
-| `none` | No faults at all (checks for false alarms) |
-| `spikes_only`, `battery_only`, `cabin_only` | One kind of fault, 1 to 3 cars |
+1. `scan_fleet` never analyses a vehicle whose last reading is older than 15 s. If more than half the fleet
+   is that old, or no vehicle exists, it returns `feed_status` = `stale` or `empty` and flags nothing.
+2. The Python client blocks every `send_ota_command` after a scan that was not `ok`.
+3. The Go server refuses to write to a vehicle whose reading is older than 15 s, or has no timestamp.
 
-Two more switches test bad data: `--silent-cars N` makes N healthy cars stop reporting when faults
-start, and `--freeze-after TICK` stops all writes (the process keeps running, so Redis keeps the
-ageing data, as in a real outage). `--manifest FILE` saves the ground truth (which cars are faulty).
-
-## Tools the Go server exposes
+## The Go server's tools
 
 | Tool | What it does |
 | --- | --- |
-| `scan_fleet()` | Checks every vehicle on the server (battery trend, cabin status, data age) and returns only the ones that need action, plus `feed_status` (`ok`, `stale` or `empty`). The agent calls this first and again after each fix. |
-| `get_fleet_snapshot(min_speed, min_temp)` | Vehicles above both thresholds, with their current registers. Reads one Redis set and one pipelined batch. |
-| `get_historical_logs(device_id)` | The newest 10 readings for one vehicle. |
-| `analyze_anomalies_stats(device_id)` | Compares the newest readings with the vehicle's own earlier readings and returns a classification. |
-| `search_maintenance_manual(query)` | Returns the fault-code manual. It currently returns the whole file whatever the query. |
-| `send_ota_command(device_id, parameter, value)` | Writes `power_parameter` or `speed_governor` after validation. Refused if the vehicle's last reading is older than 15 s. |
-| `wait_for_telemetry(seconds)` | Pauses up to 15 s so new readings arrive before a re-check. |
-
-## Stale data
-
-A stopped feed must not look like a healthy fleet. Three layers handle it:
-
-1. `scan_fleet` never analyses a vehicle whose last reading is older than 15 s. If more than half the
-   fleet is that old, or no vehicle exists, it returns `feed_status` = `stale` or `empty` and flags nothing.
-2. The Python client blocks every `send_ota_command` after a scan that was not `ok`.
-3. The Go server refuses to write to a vehicle whose reading is older than 15 s (or has no timestamp),
-   even if a client skips the first two layers.
-
-The prompt tells the agent to report `STALE TELEMETRY`, but nothing relies on the prompt alone: in an
-earlier run the agent ignored that rule on 19-second-old data and wrote to the vehicles.
+| `scan_fleet()` | Checks every vehicle (battery trend, cabin status, data age) and returns the ones that need action, plus `feed_status` (`ok`, `stale`, `empty`) |
+| `send_ota_command(device_id, parameter, value)` | Writes `power_parameter` or `speed_governor` after validation. Refused on stale data |
+| `wait_for_telemetry(seconds)` | Pauses up to 15 s so new readings arrive before a re-check |
+| `analyze_anomalies_stats(device_id)` | Detector result for one vehicle |
+| `get_historical_logs(device_id)` | Newest 10 readings for one vehicle |
+| `get_fleet_snapshot(min_speed, min_temp)` | Vehicles above both thresholds. The agent no longer uses it: it skipped cars below its own filter, so the scan checks everything on the server |
+| `search_maintenance_manual(query)` | Returns the fault-code manual (the whole file, whatever the query) |
 
 ## The detector
 
 Each vehicle keeps its last 60 readings. The newest 5 are compared with the older ones, never with
-themselves. Comparing a reading with a window that contains it limits the z-score (with 10 points
-it can never exceed 3), so a real runaway could not be told from noise.
+themselves (a window that contains the reading limits the z-score to 3 and hides real runaways).
 
 | Classification | Meaning | Agent action |
 | --- | --- | --- |
-| `sustained_anomaly` | Median of the newest 5 is above 2.5 standard deviations (or above 60 °C) | Mitigate |
-| `rising_trend` | Steady climb, or two high readings in a row | Mitigate |
-| `transient_spike` | One high reading after a normal one | Ignore |
+| `sustained_anomaly` | Median of the newest 5 is above 2.5 standard deviations (or above 60 °C) | Fix |
+| `rising_trend` | Steady climb, or two high readings in a row | Fix |
+| `transient_spike` | One high reading after a normal one, with no climb before it | Ignore |
 | `nominal` | Everything else, including cooling after a fix | Nothing |
 | `insufficient_data` | Fewer than 15 readings | Wait |
 
-The baseline spread has a floor of 0.5 °C so a very quiet sensor does not turn a 1 °C wiggle into a
-huge score. The slope uses the Theil-Sen estimator (median of pairwise slopes) so one stray reading
-does not look like a climb.
+The spread has a floor of 0.5 °C. The slope uses the Theil-Sen estimator (median of pairwise slopes) so one
+stray reading does not look like a climb.
 
-## Two safety layers
-
-The model can produce bad tool calls, so writes are checked twice:
-
-1. `agent-client-python/guardrails.py` runs before the call leaves the agent.
-2. `mcp-server-go/server/validate.go` runs again inside the server, so a client that skips layer 1
-   still cannot write an unsafe value.
-
-Rules: device ID `car_` plus exactly three ASCII digits; `power_parameter` accepts only `eco_mode`;
-`speed_governor` accepts a whole number from 20 to 60; every other register is rejected. Both
-layers are tested against the same file, `testdata/ota_cases.json`. Run
-`python scripts/bad_ota_demo.py` to watch the server reject unsafe calls on its own.
+On the simulator the detector flags a battery fault when it is about 1.4 °C above normal: about 2 s after a
+0.6 °C/s fault begins and 8 to 11 s after a slow 0.15 °C/s one. It raised no alarm on 4,000 healthy readings
+or on 70 sensor blips. The table, and a bug this test found, are in [docs/DETECTION_LATENCY.md](docs/DETECTION_LATENCY.md).
 
 ## Run it
 
-Needs Docker, Go 1.25+, Python 3.11+ and an Anthropic API key.
+Needs Docker, Go (version in `mcp-server-go/go.mod`), Python 3.11+, and an Anthropic API key for the Claude agent.
 
 ```bash
 cp .env.example .env                                  # add ANTHROPIC_API_KEY
 python -m venv .venv && source .venv/bin/activate
 pip install -r agent-client-python/requirements.txt -r requirements-dev.txt
 
-make up                                               # Redis
-make simulator                                        # terminal 1: faults begin after 60 s
+make up                                               # Redis (this machine only)
+make simulator ARGS="--fault-start-tick 20"           # terminal 1: faults begin after 20 s
 make run                                              # terminal 2: start after the faults begin
 ```
 
-Use `make simulator ARGS="--fault-start-tick 20"` for a faster demo, or `--seed N` for a different run.
+No API key? `python agent-client-python/baseline_agent.py` runs a rule-based agent on the same tools.
 
 ## Tests
 
 ```bash
 make test      # go vet, go test, pytest. No Redis, Docker or API key needed.
+make latency   # detector speed table
 ```
 
-CI runs the same checks on every push and pull request. The tests cover the detector maths, the
-simulator physics, the Redis writer (with an in-memory Redis) and both safety layers. They do not
-call the model, so agent behaviour is checked by running it.
+CI runs the same checks on every push and pull request. The tests cover the detector (including the
+simulator's own series), the simulator physics, the Redis writer (in-memory Redis), both write checks, the
+agent loop (fake model, fake server), the scorer, and the rule-based agent. They do not call the model.
 
 ## Evaluation
 
-`make eval ARGS="--runs 20"` runs the real agent against 20 different simulated fleets and scores each
-run against the simulator's ground truth. It needs Redis (`make up`), an API key, and about 20 minutes.
+`make eval ARGS="--runs 20"` runs the Claude agent against 20 seeded fleets (about 20 minutes, needs an API
+key) and scores each run against the simulator's ground truth. The score reads what the agent did and what the
+server showed it afterwards, not the agent's own report, which can contain wrong numbers. A run passes only
+if every fault is fixed, nothing else is written, and a later scan confirms the fix.
 
-| Case kind | What it checks |
-| --- | --- |
-| `random` (half the suite) | Every faulty car is fixed, nothing else is touched, the fix is confirmed by a later scan |
-| `none` | No fault: the agent must write nothing |
-| `spikes_only` | Only sensor blips: the agent must write nothing |
-| `silent` | Five healthy cars stop reporting; the faults on other cars must still be fixed and the silent cars left alone |
-| `freeze` | The whole feed dies with faults visible in the old data: the agent must write nothing and report stale telemetry |
+Standard suite: random fault layouts, no faults, sensor blips only, five healthy cars going silent, and a
+dead feed. `--suite hard` adds a car with both faults, a faulty car that stops reporting, and a slow ramp.
+`make eval-baseline` runs the same cases with the rule-based agent, with no key and no cost, to show what the
+model adds. See [docs/EVALUATION.md](docs/EVALUATION.md).
 
-A run passes only if all its checks hold. The score reads what the agent did (the writes that
-succeeded in the ledger) and what the server showed it afterwards, not the agent's own report, which
-can contain wrong numbers. Cases that fail for setup reasons (the agent never started) are listed as
-`INVALID` and are not counted as passes or failures. The summary gives the pass rate with a 95%
-interval: with 20 runs that interval is wide, and it is the number to quote.
+## Results
 
-`python scripts/eval_runs.py --score-ledger logs/<file>.jsonl --expect default --session-start 2026-10-06T18:37`
-scores runs you already made.
-
-## Audit ledger
-
-Every run appends to `logs/fleet_agent_ledger_YYYY-MM-DD.jsonl`: each model turn (with token counts),
-each tool request and response, and each guardrail rejection. A sample from an earlier version is in
-`artifacts/`.
-
-## Results (Claude Haiku 4.5, 20 seeded fleets, 2026-10-06)
+Claude Haiku 4.5, 20 seeded fleets, 2026-10-06 (files in `artifacts/eval_20261006/`).
 
 | Case | Passed |
-|---|---|
+| --- | --- |
 | Random faults (0-3 battery, 0-3 cabin, 0-3 sensor blips) | 12 / 12 |
 | No faults | 2 / 2 |
 | Sensor blips only | 2 / 2 |
 | 5 healthy cars stop reporting | 2 / 2 |
 | Whole feed dead | 2 / 2 |
 
-- 20 of 20 runs passed (95% interval 84% to 100%). 43 of 43 injected faults fixed.
-  No write to a healthy, blip or silent car.
+- 20 of 20 runs passed (95% interval 84% to 100%). 43 of 43 injected faults fixed. No write to a healthy,
+  blip or silent car.
 - Median 6 turns, 20.9k input tokens and 26 s per run.
-- A pass needs every fault fixed, no other writes, and a later scan showing the fix.
-  The agent's own report is not used for scoring.
-- Limits: one model, one run per seed, one day.
+- Limits: one model, one run per seed, one day. The simulator, detector and scorer were written by the same
+  person. This run happened before a fix to the lone-spike rule (docs/DETECTION_LATENCY.md). The hard-suite
+  runs below and both rule-based runs used the fixed detector; Claude's standard suite was not repeated.
+
+### Claude versus a rule-based agent
+
+Both agents ran the same seeded cases with the same tools, write checks and scorer
+(`artifacts/eval_20261006/`, `artifacts/eval_baseline_20261009/`, `artifacts/eval_hard_baseline_20261009/`,
+`artifacts/eval_hard_llm_20261009/`).
+
+| Suite | Agent | Runs passed | Faults fixed | Input tokens per run (median) | Seconds per run (median) |
+| --- | --- | --- | --- | --- | --- |
+| Standard, 20 fleets | Claude Haiku 4.5 | 20 / 20 | 43 / 43 | 20.9k | 26 |
+| Standard, 20 fleets | Rules | 20 / 20 | 43 / 43 | 0 | 8 |
+| Hard, 12 fleets (dual fault, silent faulty car, slow ramp) | Claude Haiku 4.5 | 12 / 12 | 45 / 45 | 25.5k | 30 |
+| Hard, 12 fleets | Rules | 12 / 12 | 45 / 45 | 0 | 8 |
+
+- On these cases the model adds no accuracy. It adds about 20 seconds and 20k to 25k input tokens per run (8 s
+  of the rule agent's time is the fixed wait after a fix).
+- The detection and the stale-data checks live in the Go server, so rules can act on what `scan_fleet` returns.
+  That is a design choice, and it is why both agents pass.
+- 12 of 12 still allows a true pass rate near 76%, so these runs cannot rank the two agents.
+- What the model provides that these cases do not measure: choosing a fix from the manual for a fault the rules
+  do not know, and a written report. Its report numbers were sometimes wrong, so the scorer ignores them. The
+  rules' report is exact but short.
+
+## What went wrong along the way
+
+- The first detector compared each reading with a window containing it, so its z-score could never pass 3
+  and it could not tell a runaway from noise. It now compares the newest readings with older ones.
+- The first write check accepted `"car_012\n"` and full-width digits, and crashed on `"²"`. The shared test
+  cases found it.
+- A real ramp was read as a one-reading spike when the ramp had already raised the baseline. A slope check
+  fixed it. Later a noisy blip was read as a ramp (5 of 70 simulated blips). The slope now ignores the newest
+  reading.
+- The agent wrote to vehicles on 19-second-old data although the prompt said not to. The check moved into code.
+- In 2 of 6 early runs the agent missed faulty batteries (one below its own 40 °C pre-filter, one that its own
+  query had returned) and still reported success. The scan moved onto the server, so it covers every car.
 
 ## Limitations
 
 - The fleet is simulated, and the detector is tuned to the simulator's noise, not to real battery data.
-- One Redis container, one agent, no authentication on Redis.
-- `search_maintenance_manual` is not a real search yet.
-- Agent decisions depend on the model; the unit tests do not cover them. `make eval` does, with a small sample.
-- The simulator, the detector's settings and the scoring were written by the same person. A different fault shape (for example a slow, noisy ramp) may behave differently.
+- One Redis container, one agent, no password on Redis (it listens on this machine only).
+- `search_maintenance_manual` is not a real search.
+- Agent decisions depend on the model. The unit tests do not cover them; `make eval` does, with a small sample.
+- The model's value is not demonstrated by these cases (see the comparison above). A case where the correct fix
+  exists only in the manual would test it.
+
+## Layout
+
+```
+agent-client-python/   Claude agent, rule-based agent, write check, error messages, tests
+mcp-server-go/         MCP server: detector, scan, validation, handlers, tests
+fleet-simulator/       fault physics, layouts, Redis writer, tests
+scripts/               eval runner and scorer, series generator, bad-write demo
+testdata/              shared write-check cases, simulator series for the detector tests
+artifacts/             sample ledgers and evaluation results
+docs/                  evaluation guide, detector latency
+```

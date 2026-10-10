@@ -15,7 +15,7 @@ import time
 
 import redis
 
-from fleet_model import PROFILES, FleetModel, build_profile
+from fleet_model import HEAT_PER_TICK, PROFILES, FleetModel, build_profile
 
 # Keep this equal to HistoryWindow in mcp-server-go/server/anomaly.go.
 HISTORY_WINDOW = 60
@@ -92,6 +92,11 @@ def parse_args(argv=None):
                         "layout per seed, none = healthy fleet, spikes_only, battery_only, cabin_only")
     p.add_argument("--silent-cars", type=int, default=0,
                    help="this many healthy cars stop reporting when faults start")
+    p.add_argument("--silent-faulty", type=int, default=0,
+                   help="this many FAULTY cars stop reporting when faults start (their fault is never visible)")
+    p.add_argument("--heat-per-tick", type=float, default=HEAT_PER_TICK,
+                   help="battery heating rate of faulty cars in degrees C per tick (default %(default)s); "
+                        "below 0.3 the climb is slow enough to be hard to see")
     p.add_argument("--freeze-after", type=int, default=None,
                    help="stop writing telemetry after this tick (simulates a dead feed)")
     p.add_argument("--manifest", default=None, help="write the ground truth of this run to this JSON file")
@@ -113,9 +118,9 @@ def run_fleet_simulator(args, redis_client=None):
     if not args.no_reset:
         reset_fleet(r)
 
-    scenarios, silent_ids = build_profile(args.profile, args.cars, args.seed, args.silent_cars)
+    scenarios, silent_ids = build_profile(args.profile, args.cars, args.seed, args.silent_cars, args.silent_faulty)
     model = FleetModel(cars=args.cars, seed=args.seed, fault_start_tick=args.fault_start_tick,
-                       scenarios=scenarios, silent_ids=silent_ids)
+                       scenarios=scenarios, silent_ids=silent_ids, heat_per_tick=args.heat_per_tick)
     truth = model.manifest()
     truth.update({"seed": args.seed, "profile": args.profile, "cars": args.cars,
                   "freeze_after": args.freeze_after})
@@ -124,7 +129,7 @@ def run_fleet_simulator(args, redis_client=None):
             json.dump(truth, f, indent=2)
     print(f"Simulating {args.cars} cars (seed={args.seed}, profile={args.profile}). "
           f"Faults start at tick {args.fault_start_tick}.")
-    print(f"Faulty cars: battery={truth['battery']} cabin={truth['cabin']} "
+    print(f"Faulty cars: battery={truth['battery']} cabin={truth['cabin']} dual={truth['dual']} "
           f"spikes={truth['spikes']} silent={truth['silent']}")
 
     seen_mitigations = set()

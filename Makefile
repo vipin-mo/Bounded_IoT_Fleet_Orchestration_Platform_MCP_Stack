@@ -1,4 +1,4 @@
-.PHONY: build run simulator up down clean clean-logs test eval
+.PHONY: build run simulator up down clean clean-logs test eval eval-baseline latency series
 
 # Default task to build the native cross-platform Go binary
 build:
@@ -30,6 +30,19 @@ test:
 # Example: make eval ARGS="--runs 20 --seed-base 1000"
 eval: build
 	python scripts/eval_runs.py $(ARGS)
+
+# The same evaluation with the rule-based agent: no API key, no cost. Compare it with `make eval`.
+# Example: make eval-baseline ARGS="--runs 20 --seed-base 1000"
+eval-baseline: build
+	python scripts/eval_runs.py --agent baseline $(ARGS)
+
+# How fast the Go detector notices a battery fault at each heating rate (no Redis, no key).
+latency:
+	cd mcp-server-go && go test ./server -run TestDetectionLatencyReport -v
+
+# Rebuild testdata/detector_series.json after changing the simulator's battery physics.
+series:
+	python scripts/gen_detector_series.py
 
 # System wide artifact cleanup
 clean:

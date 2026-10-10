@@ -135,7 +135,7 @@ def test_suite_stops_after_repeated_invalid_cases(tmp_path, monkeypatch, capsys)
     monkeypatch.setattr(ev, "preflight", lambda: None)
     calls = []
 
-    def fake_run_case(case, case_dir, lead, timeout):
+    def fake_run_case(case, case_dir, lead, timeout, **kwargs):
         calls.append(case["index"])
         return {"index": case["index"], "kind": case["kind"], "seed": case["seed"],
                 "fault_start": case["fault_start"], "error": "agent crashed: AuthenticationError"}
@@ -150,7 +150,7 @@ def test_valid_cases_reset_the_invalid_streak(tmp_path, monkeypatch):
     outcomes = iter(["bad", "bad", "good", "bad", "bad", "good"])
     seen = []
 
-    def fake_run_case(case, case_dir, lead, timeout):
+    def fake_run_case(case, case_dir, lead, timeout, **kwargs):
         seen.append(case["index"])
         base = {"index": case["index"], "kind": case["kind"], "seed": case["seed"], "fault_start": case["fault_start"]}
         if next(outcomes) == "bad":
@@ -161,3 +161,60 @@ def test_valid_cases_reset_the_invalid_streak(tmp_path, monkeypatch):
     monkeypatch.setattr(ev, "run_case", fake_run_case)
     ev.main(["--runs", "6", "--out", str(tmp_path)])
     assert seen == [1, 2, 3, 4, 5, 6]
+
+
+# ---- hard suite, agent choice ----------------------------------------------------------------
+
+def test_hard_suite_has_the_three_new_kinds_and_leaves_the_standard_suite_alone():
+    hard = ev.build_suite(12, 2000, "hard")
+    assert {c["kind"] for c in hard} == {"dual", "silent_fault", "slow_ramp"}
+    assert ev.build_suite(20, 1000) == ev.build_suite(20, 1000, "standard")      # default unchanged
+    assert [c["kind"] for c in ev.build_suite(20, 1000)].count("random") == 12
+
+
+def test_published_standard_suite_is_unchanged():
+    """The 20 cases behind artifacts/eval_20261006 (seed base 1000) must stay exactly as they were."""
+    suite = ev.build_suite(20, 1000)
+    assert [(c["kind"], c["seed"], c["fault_start"]) for c in suite[:9]] == [
+        ("random", 1000, 20), ("random", 1011, 30), ("none", 1022, 40), ("random", 1033, 50),
+        ("spikes_only", 1044, 20), ("random", 1055, 30), ("silent", 1066, 40), ("random", 1077, 50),
+        ("freeze", 1088, 20)]
+    assert suite[8]["freeze_after"] == 35 and suite[6]["silent_cars"] == 5
+
+
+def test_hard_cases_use_the_right_simulator_options():
+    by_kind = {c["kind"]: c for c in ev.build_suite(3, 1, "hard")}
+    assert by_kind["dual"]["profile"] == "dual" and not by_kind["dual"]["silent_faulty"]
+    assert by_kind["silent_fault"]["silent_faulty"] == 1
+    assert by_kind["slow_ramp"]["heat_per_tick"] == ev.SLOW_RAMP_HEAT and by_kind["slow_ramp"]["profile"] == "battery_only"
+    cmd = ev.simulator_command(by_kind["slow_ramp"], Path("m.json"))
+    assert cmd[cmd.index("--heat-per-tick") + 1] == str(ev.SLOW_RAMP_HEAT)
+    cmd = ev.simulator_command(by_kind["silent_fault"], Path("m.json"))
+    assert cmd[cmd.index("--silent-faulty") + 1] == "1"
+
+
+def test_hard_cases_wait_long_enough():
+    for c in ev.build_suite(6, 1, "hard"):
+        wait = ev.wait_seconds(c, 15) - c["fault_start"]
+        if c["kind"] == "silent_fault":
+            assert wait >= 16                      # silent car must be older than the 15 s limit
+        if c["kind"] == "slow_ramp":
+            assert wait >= 25                      # slowest measured detection of this ramp is 11 s
+
+
+def test_agent_flag_picks_the_script_and_defaults_to_llm():
+    assert ev.parse_args([]).agent == "llm" and ev.parse_args([]).suite == "standard"
+    assert ev.parse_args(["--agent", "baseline", "--suite", "hard"]).agent == "baseline"
+    assert ev.AGENT_SCRIPTS["llm"].name == "main.py" and ev.AGENT_SCRIPTS["baseline"].name == "baseline_agent.py"
+
+
+def test_main_passes_the_agent_choice_to_run_case(tmp_path, monkeypatch):
+    monkeypatch.setattr(ev, "preflight", lambda: None)
+    seen = {}
+
+    def fake_run_case(case, case_dir, lead, timeout, agent=None, **kw):
+        seen["agent"] = agent
+        return {"index": 1, "kind": case["kind"], "seed": 1, "fault_start": 20, "error": "x"}
+    monkeypatch.setattr(ev, "run_case", fake_run_case)
+    ev.main(["--runs", "1", "--agent", "baseline", "--out", str(tmp_path)])
+    assert seen["agent"].keywords == {"name": "baseline"}

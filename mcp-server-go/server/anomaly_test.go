@@ -77,6 +77,9 @@ func TestAnalyzeTemperatureSeriesClassification(t *testing.T) {
 	}
 }
 
+// Found on a real run: the agent started 40 s after a battery fault began. The ramp had already
+// pulled the baseline up, so the first reading to cross 2.5 looked like a lone spike and the fault
+// was ignored. A ramp has a steady positive slope; a spike does not.
 func TestRampWithContaminatedBaselineIsNotASpike(t *testing.T) {
 	for _, rampReadings := range []int{33, 34, 35, 36} {
 		temps := join(flatSeries(20, 30), rampTail(30, 0.6, rampReadings))
@@ -85,6 +88,21 @@ func TestRampWithContaminatedBaselineIsNotASpike(t *testing.T) {
 			t.Fatalf("ramp of %d readings classified %q (z=%.2f slope=%.3f), want rising_trend or sustained_anomaly",
 				rampReadings, got.Classification, got.ZScore, got.SlopePerReading)
 		}
+	}
+}
+
+// Found by running the detector over simulator series (TestDetectorOnSimulatedSeries): with a spike as the
+// newest reading, 4 of the 10 pairwise slopes are the spike, and sensor noise on the other six can push
+// the median slope over the limit. The old rule then called a one-reading blip a rising trend, which
+// would make the agent change a healthy car. The spike test now looks at the readings BEFORE the newest.
+func TestNoisySensorBeforeASpikeIsStillASpike(t *testing.T) {
+	temps := join(flatSeries(55, 30), []float64{29.8, 30.2, 29.9, 30.3, 42})
+	got := AnalyzeTemperatureSeries(temps)
+	if got.Classification != ClassTransientSpike {
+		t.Fatalf("classification = %q, want %q (slope=%.2f)", got.Classification, ClassTransientSpike, got.SlopePerReading)
+	}
+	if got.SlopePerReading <= RisingSlopeLimit {
+		t.Fatalf("test is no longer meaningful: the slope including the spike (%.2f) should exceed %.1f", got.SlopePerReading, RisingSlopeLimit)
 	}
 }
 

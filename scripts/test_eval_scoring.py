@@ -24,7 +24,9 @@ class Ledger:
         return self.add("MODEL_TURN", {"turn": n, "stop_reason": "tool_use", "input_tokens": inp, "output_tokens": 100})
 
     def scan(self, flagged=(), feed="ok"):
-        body = {"feed_status": feed, "flagged": [{"device_id": d, "slope_per_reading": s} for d, s in flagged]}
+        # each flagged item is (device, slope) or (device, slope, issues)
+        body = {"feed_status": feed, "flagged": [
+            {"device_id": f[0], "slope_per_reading": f[1], **({"issues": f[2]} if len(f) > 2 else {})} for f in flagged]}
         return self.add("TOOL_RESPONSE", {"tool": "scan_fleet", "result": json.dumps(body), "is_error": False})
 
     def write(self, device, register, value, ok=True):
@@ -208,3 +210,84 @@ def test_aggregate_counts_invalid_runs_apart_and_report_renders():
     assert agg["faults_fixed"] == 4 and agg["faults_injected"] == 4
     text = render_summary([ok, bad, invalid])
     assert "Passed: 1 / 2" in text and "INVALID" in text and "FAIL" in text and "| random |" in text
+
+
+# ---- dual-fault cars and silent faulty cars -------------------------------------------------
+
+DUAL = {"battery": [], "cabin": [], "dual": ["car_005"], "spikes": [], "silent": [], "freeze_after": None}
+
+
+def dual_run(fix_battery=True, fix_cabin=True, after=None):
+    led = Ledger().turn().scan([("car_005", 0.6, ["battery_sustained_anomaly", "cabin_overheating_critical"])])
+    if fix_battery:
+        led.write("car_005", "power_parameter", "eco_mode")
+    if fix_cabin:
+        led.write("car_005", "speed_governor", "50")
+    led.scan(after if after is not None else [("car_005", -0.8, ["battery_sustained_anomaly"])]).done()
+    return led
+
+
+def test_dual_fault_car_needs_both_fixes():
+    r = score_session(DUAL, dual_run().summary())
+    assert r["passed"], r["reasons"]
+    assert sorted(r["fixed"]) == ["car_005:power_parameter", "car_005:speed_governor"]
+    assert set(r["expected"]) == {"car_005:power_parameter", "car_005:speed_governor"}
+
+
+def test_dual_fault_car_with_only_one_fix_is_a_miss():
+    r = score_session(DUAL, dual_run(fix_cabin=False).summary())
+    assert not r["passed"] and r["missed"] == ["car_005:speed_governor"]
+    r = score_session(DUAL, dual_run(fix_battery=False, after=[]).summary())
+    assert not r["passed"] and r["missed"] == ["car_005:power_parameter"]
+
+
+def test_still_flagged_for_the_other_fault_does_not_fail_this_fix():
+    # battery is cooling (still flagged for battery) and the cabin flag is gone: both verified
+    assert score_session(DUAL, dual_run().summary())["unverified"] == []
+
+
+def test_dual_fault_cabin_still_flagged_after_governor_is_unverified():
+    after = [("car_005", -0.8, ["battery_sustained_anomaly", "cabin_overheating_critical"])]
+    r = score_session(DUAL, dual_run(after=after).summary())
+    assert r["unverified"] == ["car_005:speed_governor"] and not r["passed"]
+
+
+def test_dual_fault_battery_still_heating_is_unverified():
+    after = [("car_005", 0.7, ["battery_sustained_anomaly"])]
+    r = score_session(DUAL, dual_run(after=after).summary())
+    assert r["unverified"] == ["car_005:power_parameter"]
+
+
+SILENT_FAULTY = {"battery": ["car_001", "car_002"], "cabin": [], "dual": [], "spikes": [],
+                 "silent": ["car_002"], "silent_faulty": ["car_002"], "freeze_after": None}
+
+
+def test_silent_faulty_car_must_be_left_alone_and_is_not_expected_to_be_fixed():
+    led = Ledger().turn().scan([("car_001", 0.5, ["battery_sustained_anomaly"])])
+    led.write("car_001", "power_parameter", "eco_mode").scan([]).done("1 vehicle stale: car_002")
+    r = score_session(SILENT_FAULTY, led.summary())
+    assert r["passed"], r["reasons"]
+    assert list(r["expected"]) == ["car_001"]
+
+
+def test_writing_to_a_silent_faulty_car_is_a_false_action():
+    led = Ledger().turn().scan([("car_001", 0.5, ["battery_sustained_anomaly"])])
+    led.write("car_001", "power_parameter", "eco_mode").write("car_002", "power_parameter", "eco_mode")
+    led.scan([]).done()
+    r = score_session(SILENT_FAULTY, led.summary())
+    assert not r["passed"] and r["false_actions"] == [["car_002", "power_parameter", "eco_mode"]]
+
+
+def test_a_blocked_attempt_on_a_silent_faulty_car_is_fine():
+    led = Ledger().turn().scan([("car_001", 0.5, ["battery_sustained_anomaly"])])
+    led.write("car_001", "power_parameter", "eco_mode").write("car_002", "power_parameter", "eco_mode", ok=False)
+    led.scan([]).done()
+    r = score_session(SILENT_FAULTY, led.summary())
+    assert r["passed"] and r["blocked_attempts"] == 1
+
+
+def test_old_manifests_without_dual_or_silent_faulty_still_score():
+    old = {"battery": ["car_012"], "cabin": [], "spikes": [], "silent": [], "freeze_after": None}
+    led = Ledger().turn().scan([("car_012", 0.5)])
+    led.write("car_012", "power_parameter", "eco_mode").scan([("car_012", -0.8)]).done()
+    assert score_session(old, led.summary())["passed"]

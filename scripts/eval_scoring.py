@@ -6,7 +6,9 @@ the report can be wrong. It looks at what the agent actually did (the writes tha
 the server showed it afterwards (the last fleet scan).
 
 Normal run (feed alive)
-    expected  every battery car gets power_parameter=eco_mode, every cabin car gets speed_governor=50
+    expected  every battery car gets power_parameter=eco_mode, every cabin car gets speed_governor=50, and a
+              dual-fault car gets both. Cars that stopped reporting ("silent") must NOT be written: the
+              server refuses stale data, so they cannot be fixed
     PASS      the agent finished, every expected fix was written, nothing else was written, and the
               last scan after the final write shows each fixed car cooling or cleared
     FAIL      a missed car, a write to any other car or register (a "false action"), no verification,
@@ -115,7 +117,7 @@ def summarize_session(events):
                 summary["scans"].append({
                     "pos": pos,
                     "feed_status": data.get("feed_status"),
-                    "flagged": {f.get("device_id"): f.get("slope_per_reading")
+                    "flagged": {f.get("device_id"): {"slope": f.get("slope_per_reading"), "issues": f.get("issues")}
                                 for f in data.get("flagged", []) if isinstance(f, dict)},
                 })
     if summary["turns"] is None:
@@ -137,24 +139,43 @@ def default_manifest(expect="default"):
 
 
 def expected_actions(manifest):
-    """device -> (register, value) the agent must write."""
-    wanted = {d: BATTERY_FIX for d in manifest.get("battery", [])}
-    wanted.update({d: CABIN_FIX for d in manifest.get("cabin", [])})
-    return wanted
+    """The fixes the agent must write: a list of (device, register, value, kind).
+
+    A dual-fault car appears twice. Cars that stopped reporting are left out: the server refuses to write
+    to them, so a correct agent leaves them alone and reports them as stale.
+    """
+    silent = set(manifest.get("silent", []))
+    wanted = []
+    for device in manifest.get("battery", []) + manifest.get("dual", []):
+        wanted.append((device, *BATTERY_FIX, "battery"))
+    for device in manifest.get("cabin", []) + manifest.get("dual", []):
+        wanted.append((device, *CABIN_FIX, "cabin"))
+    return [w for w in wanted if w[0] not in silent]
 
 
 def _verified(device, kind, scans, last_write_pos):
-    """Did the last scan after the final write show this car cooling or cleared?"""
+    """Did the last scan after the final write show this fix working?
+
+    battery: the car is no longer flagged for its battery, or its temperature is falling
+    cabin:   the car is no longer flagged for its cabin
+    A car can still be flagged for the OTHER fault (dual-fault cars), which does not count against this fix.
+    """
     after = [s for s in scans if s["pos"] > last_write_pos]
     if not after:
         return False
     last = after[-1]
     if last["feed_status"] != "ok":
         return False
-    if device not in last["flagged"]:
+    entry = last["flagged"].get(device)
+    if entry is None:
         return True
-    slope = last["flagged"][device]
-    return kind == "battery" and isinstance(slope, (int, float)) and slope < 0
+    issues, slope = entry["issues"], entry["slope"]
+    falling = isinstance(slope, (int, float)) and slope < 0
+    if issues is None:                       # older ledgers did not record the reasons
+        return kind == "battery" and falling
+    if kind == "cabin":
+        return not any(str(i).startswith("cabin_") for i in issues)
+    return not any(str(i).startswith("battery_") for i in issues) or falling
 
 
 def score_session(manifest, summary):
@@ -191,22 +212,25 @@ def score_session(manifest, summary):
         return result
 
     wanted = expected_actions(manifest)
-    kinds = {d: "battery" for d in manifest.get("battery", [])}
-    kinds.update({d: "cabin" for d in manifest.get("cabin", [])})
-    result["expected"] = {d: list(a) for d, a in wanted.items()}
+    per_device = {}
+    for device, *_ in wanted:
+        per_device[device] = per_device.get(device, 0) + 1
+
+    def label(device, register):
+        # one fix on a car: the car id. Two fixes (dual fault): car id and register, so they stay apart.
+        return device if per_device[device] == 1 else f"{device}:{register}"
+
+    result["expected"] = {label(d, r): [r, v] for d, r, v, _ in wanted}
 
     done = set(writes)
-    for device, action in wanted.items():
-        if (device, *action) in done:
-            result["fixed"].append(device)
-        else:
-            result["missed"].append(device)
-    wanted_set = {(d, *a) for d, a in wanted.items()}
+    for device, register, value, _ in wanted:
+        (result["fixed"] if (device, register, value) in done else result["missed"]).append(label(device, register))
+    wanted_set = {(d, r, v) for d, r, v, _ in wanted}
     result["false_actions"] = [list(w) for w in writes if w not in wanted_set]
 
-    for device in result["fixed"]:
-        if not _verified(device, kinds[device], summary["scans"], summary["last_write_pos"]):
-            result["unverified"].append(device)
+    for device, register, value, kind in wanted:
+        if (device, register, value) in done and not _verified(device, kind, summary["scans"], summary["last_write_pos"]):
+            result["unverified"].append(label(device, register))
 
     if result["missed"]:
         reasons.append("missed: " + ", ".join(result["missed"]))
