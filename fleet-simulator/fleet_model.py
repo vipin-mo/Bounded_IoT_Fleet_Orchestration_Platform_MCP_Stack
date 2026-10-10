@@ -1,4 +1,4 @@
-"""Pure fleet physics for the simulator.
+"""Pure fleet physics for the simulator. There is no Redis in this file, so it can be unit tested.
 
 Each tick the model produces one telemetry reading per car. Cars follow one of four scenarios:
 
@@ -9,9 +9,14 @@ Each tick the model produces one telemetry reading per car. Cars follow one of f
                    If a `speed_governor` is set the speed is capped and, a few ticks later, the
                    cabin status returns to 'nominal' (closed loop).
   transient_spike  one single hot reading every SPIKE_EVERY ticks. A correct agent must NOT react.
+
+`build_profile` chooses which cars get which scenario, so a test run can use the original fixed cars
+("default") or a different random layout for every seed ("random"), with or without faults.
 """
 import random
 from dataclasses import dataclass
+
+PROFILES = ("default", "random", "none", "spikes_only", "battery_only", "cabin_only")
 
 NOMINAL = "nominal"
 BATTERY_RUNAWAY = "battery_runaway"
@@ -38,6 +43,56 @@ TEMP_NOISE = 0.15          # standard deviation of sensor noise, degrees C
 SPEED_NOISE = 1.5
 
 
+def build_profile(profile, cars, seed, silent_cars=0):
+    """Pick the scenario of every car. Returns (scenarios, silent_ids).
+
+    scenarios  maps car index -> scenario name (cars that are not listed are healthy)
+    silent_ids is a set of device ids that stop reporting once faults start (healthy cars only)
+
+    The layout comes from its own random generator, seeded by (profile, seed), so choosing a profile
+    never changes the physics of a run and the same seed always gives the same layout.
+    """
+    if profile not in PROFILES:
+        raise ValueError(f"unknown profile {profile!r}; choose one of {', '.join(PROFILES)}")
+    layout_rng = random.Random(f"layout:{profile}:{seed}")
+
+    if profile == "default":
+        scenarios = {i: s for i, s in DEFAULT_SCENARIOS.items() if i < cars}
+    else:
+        if profile == "none":
+            counts = (0, 0, 0)
+        elif profile == "spikes_only":
+            counts = (0, 0, layout_rng.randint(1, 3))
+        elif profile == "battery_only":
+            counts = (layout_rng.randint(1, 3), 0, 0)
+        elif profile == "cabin_only":
+            counts = (0, layout_rng.randint(1, 3), 0)
+        else:  # random: 0-3 of each kind, at least one real fault
+            while True:
+                counts = (layout_rng.randint(0, 3), layout_rng.randint(0, 3), layout_rng.randint(0, 3))
+                if counts[0] + counts[1] > 0:
+                    break
+        needed = sum(counts) + silent_cars
+        if needed > cars:
+            raise ValueError(f"profile needs {needed} cars but the fleet has only {cars}")
+        chosen = layout_rng.sample(range(cars), needed)
+        scenarios = {}
+        cursor = 0
+        for scenario, count in zip((BATTERY_RUNAWAY, CABIN_INVERTER, TRANSIENT_SPIKE), counts):
+            for idx in chosen[cursor:cursor + count]:
+                scenarios[idx] = scenario
+            cursor += count
+        silent_idx = chosen[cursor:]
+        return scenarios, {f"car_{i:03d}" for i in silent_idx}
+
+    # default profile: silent cars come from healthy cars, picked by the layout generator
+    healthy = [i for i in range(cars) if i not in scenarios]
+    if silent_cars > len(healthy):
+        raise ValueError("not enough healthy cars to silence")
+    silent_idx = layout_rng.sample(healthy, silent_cars)
+    return scenarios, {f"car_{i:03d}" for i in silent_idx}
+
+
 @dataclass
 class CarState:
     device_id: str
@@ -59,9 +114,10 @@ def _governor_limit(raw):
 
 
 class FleetModel:
-    def __init__(self, cars=100, seed=42, fault_start_tick=60, scenarios=None):
+    def __init__(self, cars=100, seed=42, fault_start_tick=60, scenarios=None, silent_ids=None):
         self.rng = random.Random(seed)
         self.fault_start_tick = fault_start_tick
+        self.silent_ids = set(silent_ids or ())
         scenarios = DEFAULT_SCENARIOS if scenarios is None else scenarios
         self.cars = []
         for idx in range(cars):
@@ -75,6 +131,18 @@ class FleetModel:
     @property
     def device_ids(self):
         return [c.device_id for c in self.cars]
+
+    def manifest(self):
+        """Ground truth for this run: which cars carry which fault. The eval script scores against it."""
+        def ids(scenario):
+            return [c.device_id for c in self.cars if c.scenario == scenario]
+        return {
+            "fault_start_tick": self.fault_start_tick,
+            "battery": ids(BATTERY_RUNAWAY),
+            "cabin": ids(CABIN_INVERTER),
+            "spikes": ids(TRANSIENT_SPIKE),
+            "silent": sorted(self.silent_ids),
+        }
 
     def step(self, tick, overrides=None):
         """Advance one tick. `overrides` maps device_id -> {"power_parameter": ..., "speed_governor": ...}

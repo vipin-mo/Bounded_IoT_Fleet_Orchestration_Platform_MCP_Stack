@@ -5,8 +5,8 @@ import pytest
 
 import simulator
 from fleet_model import (
-    BATTERY_RUNAWAY, CABIN_INVERTER, TRANSIENT_SPIKE, DEFAULT_SCENARIOS,
-    MAX_HEAT, SPIKE_EVERY, FleetModel,
+    BATTERY_RUNAWAY, CABIN_INVERTER, TRANSIENT_SPIKE, DEFAULT_SCENARIOS, PROFILES,
+    MAX_HEAT, SPIKE_EVERY, FleetModel, build_profile,
 )
 
 FAULT_START = 30
@@ -138,3 +138,108 @@ def test_reset_fleet_clears_old_state(redis_client):
     redis_client.hset("device:car_001", "power_parameter", "eco_mode")
     simulator.reset_fleet(redis_client)
     assert redis_client.keys("*") == []
+
+
+# ---- Test layouts (profiles) --------------------------------------------------------------
+
+def count(scenarios, kind):
+    return sum(1 for s in scenarios.values() if s == kind)
+
+
+def test_default_profile_is_the_original_fixed_layout_and_keeps_old_runs_identical():
+    scenarios, silent = build_profile("default", 100, seed=999)
+    assert scenarios == DEFAULT_SCENARIOS and silent == set()
+    old = run(FleetModel(seed=7, fault_start_tick=FAULT_START), 80)
+    new = run(FleetModel(seed=7, fault_start_tick=FAULT_START, scenarios=scenarios), 80)
+    assert old == new
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+def test_profiles_are_deterministic_and_use_distinct_cars(profile):
+    a = build_profile(profile, 100, seed=11, silent_cars=4)
+    b = build_profile(profile, 100, seed=11, silent_cars=4)
+    assert a == b
+    scenarios, silent = a
+    assert len(silent) == 4
+    assert not (silent & {f"car_{i:03d}" for i in scenarios})      # silent cars are healthy cars
+    assert all(0 <= i < 100 for i in scenarios)
+
+
+def test_random_profile_changes_with_the_seed_and_always_has_a_real_fault():
+    layouts = set()
+    for seed in range(60):
+        scenarios, _ = build_profile("random", 100, seed)
+        assert count(scenarios, BATTERY_RUNAWAY) + count(scenarios, CABIN_INVERTER) >= 1
+        layouts.add(tuple(sorted(scenarios.items())))
+    assert len(layouts) > 40
+
+
+def test_profile_kinds_match_their_names():
+    for seed in range(20):
+        none, _ = build_profile("none", 100, seed)
+        spikes, _ = build_profile("spikes_only", 100, seed)
+        battery, _ = build_profile("battery_only", 100, seed)
+        cabin, _ = build_profile("cabin_only", 100, seed)
+        assert none == {}
+        assert set(spikes.values()) == {TRANSIENT_SPIKE}
+        assert set(battery.values()) == {BATTERY_RUNAWAY}
+        assert set(cabin.values()) == {CABIN_INVERTER}
+
+
+def test_choosing_a_profile_does_not_change_the_starting_conditions_of_cars():
+    # base temperature and speed come from the physics generator. The layout uses its own generator,
+    # so every profile starts every car from the same values for the same seed.
+    default = FleetModel(seed=5, scenarios=build_profile("default", 100, 5)[0])
+    random_ = FleetModel(seed=5, scenarios=build_profile("random", 100, 5)[0])
+    none = FleetModel(seed=5, scenarios=build_profile("none", 100, 5)[0])
+    for i in range(100):
+        assert default.cars[i].base_temp == random_.cars[i].base_temp == none.cars[i].base_temp
+        assert default.cars[i].base_speed == random_.cars[i].base_speed == none.cars[i].base_speed
+
+
+def test_profile_errors():
+    with pytest.raises(ValueError):
+        build_profile("chaos", 100, 1)
+    with pytest.raises(ValueError):
+        build_profile("random", 5, 1, silent_cars=10)
+    with pytest.raises(ValueError):
+        build_profile("default", 30, 1, silent_cars=29)
+
+
+def test_manifest_lists_the_ground_truth():
+    scenarios, silent = build_profile("default", 100, 1, silent_cars=3)
+    manifest = FleetModel(seed=1, fault_start_tick=40, scenarios=scenarios, silent_ids=silent).manifest()
+    assert manifest["battery"] == ["car_012", "car_035"]
+    assert manifest["cabin"] == ["car_068", "car_088"]
+    assert manifest["spikes"] == ["car_020", "car_050"]
+    assert len(manifest["silent"]) == 3 and manifest["fault_start_tick"] == 40
+
+
+# ---- Silent cars, frozen feed and the run loop (fakeredis) --------------------------------
+
+def test_filter_states_rules():
+    states = [{"device_id": "car_001"}, {"device_id": "car_002"}]
+    assert simulator.filter_states(states, 5, 20, {"car_002"}, None) == states            # before faults
+    assert simulator.filter_states(states, 20, 20, {"car_002"}, None) == [states[0]]      # silent now
+    assert simulator.filter_states(states, 30, 20, set(), 25) == []                       # frozen
+    assert simulator.filter_states(states, 25, 20, set(), 25) == states                   # last live tick
+    assert simulator.filter_states(states, 99, 20, {"car_002"}, None) == [states[0]]
+
+
+def test_run_loop_with_silent_cars_frozen_feed_and_manifest(redis_client, tmp_path):
+    manifest = tmp_path / "truth.json"
+    args = simulator.parse_args([
+        "--cars", "30", "--seed", "3", "--profile", "random", "--fault-start-tick", "20",
+        "--ticks", "40", "--interval", "0", "--silent-cars", "3", "--freeze-after", "30",
+        "--manifest", str(manifest),
+    ])
+    simulator.run_fleet_simulator(args, redis_client=redis_client)
+
+    truth = json.loads(manifest.read_text())
+    assert truth["profile"] == "random" and truth["freeze_after"] == 30 and len(truth["silent"]) == 3
+    healthy = next(d for d in (f"car_{i:03d}" for i in range(30))
+                   if d not in truth["silent"] + truth["battery"] + truth["cabin"] + truth["spikes"])
+    assert redis_client.llen(f"logs:{healthy}") == 31                       # ticks 0..30, then frozen
+    for silent in truth["silent"]:
+        assert redis_client.llen(f"logs:{silent}") == 20                    # ticks 0..19, then silent
+    assert len(redis_client.smembers(simulator.DEVICE_SET_KEY)) == 30        # silent cars stay registered
