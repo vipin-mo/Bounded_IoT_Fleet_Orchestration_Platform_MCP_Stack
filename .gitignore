@@ -6,3 +6,4 @@ mcp-server-go-binary
 logs/
 .DS_Store
 .pytest_cache/
+eval_results/

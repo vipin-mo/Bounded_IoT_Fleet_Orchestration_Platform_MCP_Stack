@@ -2,26 +2,34 @@ import asyncio
 import os
 import json
 import shutil
+import sys
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from anthropic import Anthropic
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from errors import describe_failure
 from guardrails import check_feed_allows_writes, parse_feed_status, validate_ota_payload
 from prompts import SYSTEM_PROMPT
 
-# Load environment configurations
-load_dotenv()
-
-if not os.environ.get("ANTHROPIC_API_KEY"):
-    raise ValueError("Missing ANTHROPIC_API_KEY in environment or .env file.")
-
-# Initialize the Anthropic Client
-anthropic_client = Anthropic()
+# Load environment configurations. override=True: the key in this project's .env wins over any
+# (possibly old) ANTHROPIC_API_KEY already exported in the shell. Without it, a stale shell key is used
+# silently and every API call fails with an authentication error.
+load_dotenv(override=True)
 
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
+# Where the current run stands, so a crash can be written to the ledger as an aborted session.
+SESSION = {"started": False, "status": "not_started"}   # status: running | completed | aborted
+
+
+def get_client():
+    """Create the API client when it is needed, so a missing key gives a clear message, not an import error."""
+    return Anthropic()
+
+
 # Hard stop so a confused model can never loop (and spend money) forever.
+# A run with two fix rounds took 12 turns, so 15 leaves room without removing the cap.
 MAX_TURNS = 15
 
 USER_PROMPT = (
@@ -72,9 +80,17 @@ def log_agent_transaction(event_type: str, payload: dict):
     with open(log_file_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(log_entry) + "\n")
 
+    if event_type == "SESSION_START":
+        SESSION.update(started=True, status="running")
+    elif event_type == "SESSION_COMPLETED":
+        SESSION["status"] = "completed"
+    elif event_type == "SESSION_ABORTED":
+        SESSION["status"] = "aborted"
+
 
 async def run_agent():
     cleanup_workspace()
+    anthropic_client = get_client()
 
     # Define standard input-output pipe routing configurations for the Go server binary
     server_params = StdioServerParameters(
@@ -211,5 +227,34 @@ async def run_agent():
             log_agent_transaction("SESSION_ABORTED", {"reason": "max_turns", "turns": MAX_TURNS})
 
 
+def record_failure(exc):
+    """Write a crash into the ledger so a failed run never looks like it never happened."""
+    detail = describe_failure(exc)
+    if SESSION["started"] and SESSION["status"] == "running":
+        log_agent_transaction("SESSION_ABORTED", {"reason": "exception", "error": detail})
+    elif not SESSION["started"]:
+        log_agent_transaction("STARTUP_FAILED", {"error": detail})
+
+
+def main():
+    """Run the agent once. Exit codes: 0 finished, 2 stopped early (turn limit etc.), 1 crashed, 130 Ctrl+C."""
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("Missing ANTHROPIC_API_KEY. Put it in .env (see .env.example) or export it, then try again.",
+              file=sys.stderr)
+        return 1
+    try:
+        asyncio.run(run_agent())
+    except KeyboardInterrupt:
+        if SESSION["started"] and SESSION["status"] == "running":
+            log_agent_transaction("SESSION_ABORTED", {"reason": "interrupted"})
+        print("\nInterrupted.", file=sys.stderr)
+        return 130
+    except Exception as exc:   # includes ExceptionGroup from the MCP client
+        print(f"\nERROR: {describe_failure(exc)}", file=sys.stderr)
+        record_failure(exc)
+        return 1
+    return 0 if SESSION["status"] == "completed" else 2
+
+
 if __name__ == "__main__":
-    asyncio.run(run_agent())
+    sys.exit(main())

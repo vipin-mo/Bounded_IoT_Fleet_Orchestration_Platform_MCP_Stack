@@ -1,4 +1,4 @@
-"""Pure fleet physics for the simulator.
+"""Pure fleet physics for the simulator. There is no Redis in this file, so it can be unit tested.
 
 Each tick the model produces one telemetry reading per car. Cars follow one of four scenarios:
 
@@ -9,14 +9,22 @@ Each tick the model produces one telemetry reading per car. Cars follow one of f
                    If a `speed_governor` is set the speed is capped and, a few ticks later, the
                    cabin status returns to 'nominal' (closed loop).
   transient_spike  one single hot reading every SPIKE_EVERY ticks. A correct agent must NOT react.
+  dual_fault       both of the first two on the same car. It needs two different fixes (eco_mode AND a
+                   speed governor), and each fix clears only its own half.
+
+`build_profile` chooses which cars get which scenario, so a test run can use the original fixed cars
+("default") or a different random layout for every seed ("random"), with or without faults.
 """
 import random
 from dataclasses import dataclass
+
+PROFILES = ("default", "random", "none", "spikes_only", "battery_only", "cabin_only", "dual")
 
 NOMINAL = "nominal"
 BATTERY_RUNAWAY = "battery_runaway"
 CABIN_INVERTER = "cabin_inverter"
 TRANSIENT_SPIKE = "transient_spike"
+DUAL_FAULT = "dual_fault"   # one car with BOTH a battery runaway and a cabin inverter fault
 
 # Same four fault cars as the original simulator, plus two noise cars.
 DEFAULT_SCENARIOS = {
@@ -36,6 +44,72 @@ SPIKE_EVERY = 20           # ticks between transient spikes
 CABIN_RECOVERY_TICKS = 5   # ticks with a governor set before the cabin status clears
 TEMP_NOISE = 0.15          # standard deviation of sensor noise, degrees C
 SPEED_NOISE = 1.5
+
+
+def build_profile(profile, cars, seed, silent_cars=0, silent_faulty=0):
+    """Pick the scenario of every car. Returns (scenarios, silent_ids).
+
+    scenarios     maps car index -> scenario name (cars that are not listed are healthy)
+    silent_ids    device ids that stop reporting once faults start. `silent_cars` of them are healthy
+                  cars; `silent_faulty` of them are faulty cars, whose fault the feed never shows.
+
+    The layout comes from its own random generator, seeded by (profile, seed), so choosing a profile
+    never changes the physics of a run and the same seed always gives the same layout. Older options
+    draw numbers in the same order as before, so layouts of existing seeds do not change.
+    """
+    if profile not in PROFILES:
+        raise ValueError(f"unknown profile {profile!r}; choose one of {', '.join(PROFILES)}")
+    layout_rng = random.Random(f"layout:{profile}:{seed}")
+
+    def assign(counts):
+        """counts: list of (scenario, how_many). Picks distinct cars and returns (scenarios, leftover indices)."""
+        needed = sum(n for _, n in counts) + silent_cars
+        if needed > cars:
+            raise ValueError(f"profile needs {needed} cars but the fleet has only {cars}")
+        chosen = layout_rng.sample(range(cars), needed)
+        out, cursor = {}, 0
+        for scenario, count in counts:
+            for idx in chosen[cursor:cursor + count]:
+                out[idx] = scenario
+            cursor += count
+        return out, chosen[cursor:]
+
+    if profile == "default":
+        scenarios = {i: s for i, s in DEFAULT_SCENARIOS.items() if i < cars}
+        healthy = [i for i in range(cars) if i not in scenarios]
+        if silent_cars > len(healthy):
+            raise ValueError("not enough healthy cars to silence")
+        silent_idx = layout_rng.sample(healthy, silent_cars)
+    else:
+        if profile == "none":
+            counts = (0, 0, 0)
+        elif profile == "spikes_only":
+            counts = (0, 0, layout_rng.randint(1, 3))
+        elif profile == "battery_only":
+            counts = (layout_rng.randint(1, 3), 0, 0)
+        elif profile == "cabin_only":
+            counts = (0, layout_rng.randint(1, 3), 0)
+        elif profile == "random":  # 0-3 of each kind, at least one real fault
+            while True:
+                counts = (layout_rng.randint(0, 3), layout_rng.randint(0, 3), layout_rng.randint(0, 3))
+                if counts[0] + counts[1] > 0:
+                    break
+        if profile == "dual":      # 1-2 dual-fault cars, 1-2 battery, 0-2 cabin, 0-2 blips: at least 2 fault cars
+            pairs = [(DUAL_FAULT, layout_rng.randint(1, 2)), (BATTERY_RUNAWAY, layout_rng.randint(1, 2)),
+                     (CABIN_INVERTER, layout_rng.randint(0, 2)), (TRANSIENT_SPIKE, layout_rng.randint(0, 2))]
+        else:
+            pairs = list(zip((BATTERY_RUNAWAY, CABIN_INVERTER, TRANSIENT_SPIKE), counts))
+        scenarios, silent_idx = assign(pairs)
+
+    silent_ids = {f"car_{i:03d}" for i in silent_idx}
+
+    if silent_faulty:
+        fault_idx = sorted(i for i, s in scenarios.items() if s != TRANSIENT_SPIKE)
+        if silent_faulty > len(fault_idx) - 1:
+            raise ValueError(f"cannot silence {silent_faulty} of {len(fault_idx)} faulty cars: "
+                             "at least one must keep reporting")
+        silent_ids |= {f"car_{i:03d}" for i in layout_rng.sample(fault_idx, silent_faulty)}
+    return scenarios, silent_ids
 
 
 @dataclass
@@ -59,9 +133,12 @@ def _governor_limit(raw):
 
 
 class FleetModel:
-    def __init__(self, cars=100, seed=42, fault_start_tick=60, scenarios=None):
+    def __init__(self, cars=100, seed=42, fault_start_tick=60, scenarios=None, silent_ids=None,
+                 heat_per_tick=HEAT_PER_TICK):
         self.rng = random.Random(seed)
         self.fault_start_tick = fault_start_tick
+        self.heat_per_tick = heat_per_tick
+        self.silent_ids = set(silent_ids or ())
         scenarios = DEFAULT_SCENARIOS if scenarios is None else scenarios
         self.cars = []
         for idx in range(cars):
@@ -75,6 +152,23 @@ class FleetModel:
     @property
     def device_ids(self):
         return [c.device_id for c in self.cars]
+
+    def manifest(self):
+        """Ground truth for this run: which cars carry which fault. The eval script scores against it."""
+        def ids(scenario):
+            return [c.device_id for c in self.cars if c.scenario == scenario]
+        battery, cabin, dual = ids(BATTERY_RUNAWAY), ids(CABIN_INVERTER), ids(DUAL_FAULT)
+        faulty = set(battery) | set(cabin) | set(dual)
+        return {
+            "fault_start_tick": self.fault_start_tick,
+            "battery": battery,
+            "cabin": cabin,
+            "dual": dual,                      # these cars need BOTH fixes
+            "spikes": ids(TRANSIENT_SPIKE),
+            "silent": sorted(self.silent_ids),
+            "silent_faulty": sorted(self.silent_ids & faulty),   # faulty cars whose fault the feed never shows
+            "heat_per_tick": self.heat_per_tick,
+        }
 
     def step(self, tick, overrides=None):
         """Advance one tick. `overrides` maps device_id -> {"power_parameter": ..., "speed_governor": ...}
@@ -91,13 +185,13 @@ class FleetModel:
             speed = car.base_speed + self.rng.gauss(0, SPEED_NOISE)
             cabin_status = "nominal"
 
-            if car.scenario == BATTERY_RUNAWAY and faulting:
+            if car.scenario in (BATTERY_RUNAWAY, DUAL_FAULT) and faulting:
                 if eco_mode:
                     car.heat = max(0.0, car.heat - COOL_PER_TICK)
                 else:
-                    car.heat = min(MAX_HEAT, car.heat + HEAT_PER_TICK)
+                    car.heat = min(MAX_HEAT, car.heat + self.heat_per_tick)
 
-            if car.scenario == CABIN_INVERTER and faulting:
+            if car.scenario in (CABIN_INVERTER, DUAL_FAULT) and faulting:
                 if governor is not None:
                     car.governed_ticks += 1
                 if governor is not None and car.governed_ticks >= CABIN_RECOVERY_TICKS:
