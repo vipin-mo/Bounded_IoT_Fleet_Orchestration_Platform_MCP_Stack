@@ -5,3 +5,4 @@ __pycache__/
 mcp-server-go-binary
 logs/
 .DS_Store
+.pytest_cache/
