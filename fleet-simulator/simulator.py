@@ -89,7 +89,8 @@ def parse_args(argv=None):
     p.add_argument("--no-reset", action="store_true", help="keep existing Redis state")
     p.add_argument("--profile", choices=PROFILES, default="default",
                    help="which cars get which fault: default = the original fixed cars, random = a new "
-                        "layout per seed, none = healthy fleet, spikes_only, battery_only, cabin_only")
+                        "layout per seed, none = healthy fleet, spikes_only, battery_only, cabin_only, dual, "
+                        "manual_only = coolant leaks whose fix is only in the manual")
     p.add_argument("--silent-cars", type=int, default=0,
                    help="this many healthy cars stop reporting when faults start")
     p.add_argument("--silent-faulty", type=int, default=0,
@@ -130,7 +131,7 @@ def run_fleet_simulator(args, redis_client=None):
     print(f"Simulating {args.cars} cars (seed={args.seed}, profile={args.profile}). "
           f"Faults start at tick {args.fault_start_tick}.")
     print(f"Faulty cars: battery={truth['battery']} cabin={truth['cabin']} dual={truth['dual']} "
-          f"spikes={truth['spikes']} silent={truth['silent']}")
+          f"coolant={truth['coolant']} spikes={truth['spikes']} silent={truth['silent']}")
 
     seen_mitigations = set()
     tick = 0

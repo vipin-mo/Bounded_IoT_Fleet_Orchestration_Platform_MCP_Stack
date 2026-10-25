@@ -6,8 +6,9 @@ the report can be wrong. It looks at what the agent actually did (the writes tha
 the server showed it afterwards (the last fleet scan).
 
 Normal run (feed alive)
-    expected  every battery car gets power_parameter=eco_mode, every cabin car gets speed_governor=50, and a
-              dual-fault car gets both. Cars that stopped reporting ("silent") must NOT be written: the
+    expected  every battery car gets power_parameter=eco_mode, every cabin car gets speed_governor=50, a
+              dual-fault car gets both, and a coolant-leak car gets speed_governor=30 (a fix that is only
+              in the manual). Cars that stopped reporting ("silent") must NOT be written: the
               server refuses stale data, so they cannot be fixed
     PASS      the agent finished, every expected fix was written, nothing else was written, and the
               last scan after the final write shows each fixed car cooling or cleared
@@ -26,6 +27,7 @@ WRITE_OK = re.compile(r"deployed to (car_[0-9]{3})\. Register '([a-z_]+)' update
 
 BATTERY_FIX = ("power_parameter", "eco_mode")
 CABIN_FIX = ("speed_governor", "50")
+COOLANT_FIX = ("speed_governor", "30")   # ERR_CABIN_COOLANT_LEAK in vehicle_fault_manual.md
 
 
 # ---- reading the ledger -------------------------------------------------------------------
@@ -150,6 +152,8 @@ def expected_actions(manifest):
         wanted.append((device, *BATTERY_FIX, "battery"))
     for device in manifest.get("cabin", []) + manifest.get("dual", []):
         wanted.append((device, *CABIN_FIX, "cabin"))
+    for device in manifest.get("coolant", []):
+        wanted.append((device, *COOLANT_FIX, "coolant"))
     return [w for w in wanted if w[0] not in silent]
 
 
@@ -157,7 +161,7 @@ def _verified(device, kind, scans, last_write_pos):
     """Did the last scan after the final write show this fix working?
 
     battery: the car is no longer flagged for its battery, or its temperature is falling
-    cabin:   the car is no longer flagged for its cabin
+    cabin:   the car is no longer flagged for its cabin (coolant leaks are cabin faults too)
     A car can still be flagged for the OTHER fault (dual-fault cars), which does not count against this fix.
     """
     after = [s for s in scans if s["pos"] > last_write_pos]
@@ -173,7 +177,7 @@ def _verified(device, kind, scans, last_write_pos):
     falling = isinstance(slope, (int, float)) and slope < 0
     if issues is None:                       # older ledgers did not record the reasons
         return kind == "battery" and falling
-    if kind == "cabin":
+    if kind in ("cabin", "coolant"):
         return not any(str(i).startswith("cabin_") for i in issues)
     return not any(str(i).startswith("battery_") for i in issues) or falling
 

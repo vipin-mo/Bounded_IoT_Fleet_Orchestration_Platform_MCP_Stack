@@ -5,7 +5,7 @@ import pytest
 
 import simulator
 from fleet_model import (
-    BATTERY_RUNAWAY, CABIN_INVERTER, TRANSIENT_SPIKE, DUAL_FAULT, DEFAULT_SCENARIOS, PROFILES,
+    BATTERY_RUNAWAY, CABIN_INVERTER, TRANSIENT_SPIKE, DUAL_FAULT, COOLANT_LEAK, DEFAULT_SCENARIOS, PROFILES,
     MAX_HEAT, SPIKE_EVERY, FleetModel, build_profile,
 )
 
@@ -350,3 +350,46 @@ def test_run_loop_silent_faulty_car_never_shows_its_fault(redis_client, tmp_path
     silent = truth["silent_faulty"][0]
     assert redis_client.llen(f"logs:{silent}") == 20                  # nothing written after the fault began
     assert redis_client.hget(f"device:{silent}", "cabin_status") == "nominal"
+
+
+# ---- Coolant leak: the fix is only in the manual --------------------------------------------
+
+def coolant_status(governor_for, ticks=FAULT_START + 40):
+    model = FleetModel(cars=3, fault_start_tick=FAULT_START, scenarios={1: COOLANT_LEAK})
+
+    def overrides(tick):
+        value = governor_for(tick)
+        return {"car_001": {"speed_governor": value}} if value is not None else {}
+    return series(run(model, ticks, overrides), "car_001", "cabin_status")
+
+
+def test_coolant_leak_clears_only_under_the_manual_governor():
+    fix_at = FAULT_START + 10
+    assert coolant_status(lambda t: None)[-1] == "coolant_leak"                       # no fix: stays
+    assert coolant_status(lambda t: "50" if t >= fix_at else None)[-1] == "coolant_leak"   # the cabin fix is not enough
+    status = coolant_status(lambda t: "30" if t >= fix_at else None)
+    assert status[FAULT_START - 1] == "nominal" and status[FAULT_START] == "coolant_leak"
+    assert status[fix_at + 3] == "coolant_leak" and status[-1] == "nominal"           # clears a few ticks after 30
+    assert coolant_status(lambda t: "25" if t >= fix_at else None)[-1] == "nominal"    # anything at or below 30 works
+
+
+def test_coolant_leak_ignores_eco_mode_and_keeps_the_battery_normal():
+    model = FleetModel(cars=3, fault_start_tick=FAULT_START, scenarios={1: COOLANT_LEAK})
+    history = run(model, FAULT_START + 40, lambda t: {"car_001": {"power_parameter": "eco_mode"}})
+    assert series(history, "car_001", "cabin_status")[-1] == "coolant_leak"
+    assert max(series(history, "car_001", "battery_temp")) < 38.0
+
+
+def test_manual_only_profile_mixes_coolant_leaks_with_ordinary_cabin_and_battery_faults():
+    for seed in range(40):
+        manifest = layout("manual_only", 100, seed)
+        assert 1 <= len(manifest["coolant"]) <= 2 and len(manifest["cabin"]) >= 1 and len(manifest["battery"]) >= 1
+        assert manifest["dual"] == []
+
+
+def test_adding_coolant_leaks_does_not_change_other_profiles_or_the_physics():
+    for profile in ("default", "random", "dual"):
+        assert layout(profile, 100, 3)["coolant"] == []
+    a = run(FleetModel(seed=7, fault_start_tick=FAULT_START), 90)
+    b = run(FleetModel(seed=7, fault_start_tick=FAULT_START, scenarios=dict(DEFAULT_SCENARIOS)), 90)
+    assert a == b
