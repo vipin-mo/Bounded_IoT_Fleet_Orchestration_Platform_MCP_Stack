@@ -14,6 +14,7 @@ the agent and the checks around it; the simulator and detector are tested separa
 | `none` | No faults (checks for false alarms) |
 | `spikes_only`, `battery_only`, `cabin_only` | One kind of fault, 1 to 3 cars |
 | `dual` | 1 to 2 cars with **both** a battery and a cabin fault, plus 1 to 2 battery, 0 to 2 cabin and 0 to 2 blips |
+| `manual_only` | 1 to 2 cars with a cabin `coolant_leak`, plus 1 to 2 ordinary cabin faults, 1 to 2 battery faults and 0 to 2 blips |
 
 | Switch | Effect |
 | --- | --- |
@@ -28,7 +29,7 @@ A layout depends only on the profile and the seed. Adding options never moves th
 
 ## Suites
 
-`python scripts/eval_runs.py --runs N --suite standard|hard --agent llm|baseline --seed-base S`
+`python scripts/eval_runs.py --runs N --suite standard|hard|manual --agent llm|baseline --seed-base S`
 
 | Suite | Case kinds | What a pass means |
 | --- | --- | --- |
@@ -36,6 +37,7 @@ A layout depends only on the profile and the seed. Adding options never moves th
 | hard | `dual` | A car with both faults gets both fixes (`eco_mode` and governor 50), and each is confirmed separately |
 | hard | `silent_fault` | A faulty car stops reporting. It must not be written to (the server refuses) and must not be counted as fixable; the other faults are fixed |
 | hard | `slow_ramp` | Battery heating at 0.15 °C/s, flagged 8 to 11 s after it starts (docs/DETECTION_LATENCY.md). Fixed and confirmed |
+| manual | `manual_only` | A coolant-leak car gets `speed_governor=30`, the fix in `ERR_CABIN_COOLANT_LEAK` of the manual. The prompt does not mention it. A governor of 50 or `eco_mode` does not clear the leak and counts as a miss plus a false action. The other faults get their usual fixes |
 
 The standard suite for a given `--seed-base` never changes, so results can be reproduced.
 
@@ -69,7 +71,11 @@ fair conclusion is that these cases do not need a model, and the model's value i
 report, and behaviour on inputs the rules do not expect.
 
 Result on 2026-10-09: both agents passed every case in the standard suite (20 of 20) and the hard suite
-(12 of 12). See the README for the table. The cases do not separate them.
+(12 of 12). Those cases do not separate them.
+
+Result on 2026-10-24, manual suite (`--runs 6 --seed-base 3000`): Claude passed 6 of 6 and the rules 0 of 6.
+The rules fixed every battery and ordinary cabin fault and left the coolant leaks alone (20 of 30 faults).
+Claude searched the manual in every run and wrote 30 to each leak. See the README for the table.
 
 ## Scoring runs you already made
 

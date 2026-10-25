@@ -291,3 +291,38 @@ def test_old_manifests_without_dual_or_silent_faulty_still_score():
     led = Ledger().turn().scan([("car_012", 0.5)])
     led.write("car_012", "power_parameter", "eco_mode").scan([("car_012", -0.8)]).done()
     assert score_session(old, led.summary())["passed"]
+
+
+# ---- coolant leak: the fix is only in the manual ----------------------------------------------
+
+COOLANT = {"battery": [], "cabin": ["car_002"], "coolant": ["car_007"], "spikes": [], "silent": [], "freeze_after": None}
+
+
+def coolant_run(coolant_value="30", after=None):
+    led = Ledger().turn().scan([("car_002", 0.0, ["cabin_overheating_critical"]), ("car_007", 0.0, ["cabin_coolant_leak"])])
+    led.write("car_002", "speed_governor", "50")
+    if coolant_value:
+        led.write("car_007", "speed_governor", coolant_value)
+    return led.scan(after if after is not None else []).done()
+
+
+def test_coolant_leak_needs_the_governor_value_from_the_manual():
+    r = score_session(COOLANT, coolant_run().summary())
+    assert r["passed"], r["reasons"]
+    assert r["expected"] == {"car_002": ["speed_governor", "50"], "car_007": ["speed_governor", "30"]}
+
+
+def test_the_ordinary_cabin_fix_on_a_coolant_leak_is_a_miss_and_a_false_action():
+    r = score_session(COOLANT, coolant_run("50", after=[("car_007", 0.0, ["cabin_coolant_leak"])]).summary())
+    assert not r["passed"]
+    assert r["missed"] == ["car_007"] and r["false_actions"] == [["car_007", "speed_governor", "50"]]
+
+
+def test_leaving_a_coolant_leak_alone_is_a_miss():
+    r = score_session(COOLANT, coolant_run(None, after=[("car_007", 0.0, ["cabin_coolant_leak"])]).summary())
+    assert not r["passed"] and r["missed"] == ["car_007"] and r["false_actions"] == []
+
+
+def test_coolant_leak_still_flagged_after_the_fix_is_unverified():
+    r = score_session(COOLANT, coolant_run(after=[("car_007", -0.4, ["cabin_coolant_leak"])]).summary())
+    assert r["unverified"] == ["car_007"] and not r["passed"]

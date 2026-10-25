@@ -218,3 +218,11 @@ def test_main_passes_the_agent_choice_to_run_case(tmp_path, monkeypatch):
     monkeypatch.setattr(ev, "run_case", fake_run_case)
     ev.main(["--runs", "1", "--agent", "baseline", "--out", str(tmp_path)])
     assert seen["agent"].keywords == {"name": "baseline"}
+
+
+def test_manual_suite_uses_the_manual_only_profile_and_leaves_the_other_suites_alone():
+    manual = ev.build_suite(6, 3000, "manual")
+    assert {c["kind"] for c in manual} == {"manual_only"} and {c["profile"] for c in manual} == {"manual_only"}
+    assert not any(c["silent_cars"] or c["silent_faulty"] or c["heat_per_tick"] or c["freeze_after"] for c in manual)
+    assert {c["kind"] for c in ev.build_suite(12, 2000, "hard")} == {"dual", "silent_fault", "slow_ramp"}
+    assert ev.parse_args(["--suite", "manual"]).suite == "manual"

@@ -11,6 +11,9 @@ Each tick the model produces one telemetry reading per car. Cars follow one of f
   transient_spike  one single hot reading every SPIKE_EVERY ticks. A correct agent must NOT react.
   dual_fault       both of the first two on the same car. It needs two different fixes (eco_mode AND a
                    speed governor), and each fix clears only its own half.
+  coolant_leak     after `fault_start_tick` the cabin status is 'coolant_leak'. Only the manual gives the
+                   fix: a speed governor of COOLANT_GOVERNOR_MAX km/h or lower. A higher governor (the 50 used
+                   for cabin_inverter) or eco_mode does nothing, so an agent that ignores the manual fails.
 
 `build_profile` chooses which cars get which scenario, so a test run can use the original fixed cars
 ("default") or a different random layout for every seed ("random"), with or without faults.
@@ -18,13 +21,14 @@ Each tick the model produces one telemetry reading per car. Cars follow one of f
 import random
 from dataclasses import dataclass
 
-PROFILES = ("default", "random", "none", "spikes_only", "battery_only", "cabin_only", "dual")
+PROFILES = ("default", "random", "none", "spikes_only", "battery_only", "cabin_only", "dual", "manual_only")
 
 NOMINAL = "nominal"
 BATTERY_RUNAWAY = "battery_runaway"
 CABIN_INVERTER = "cabin_inverter"
 TRANSIENT_SPIKE = "transient_spike"
 DUAL_FAULT = "dual_fault"   # one car with BOTH a battery runaway and a cabin inverter fault
+COOLANT_LEAK = "coolant_leak"   # a cabin fault whose fix is written only in the manual
 
 # Same four fault cars as the original simulator, plus two noise cars.
 DEFAULT_SCENARIOS = {
@@ -42,6 +46,7 @@ MAX_HEAT = 55.0            # the battery cannot heat beyond base temperature + t
 SPIKE_SIZE = 12.0          # degrees C added for one reading of a transient spike
 SPIKE_EVERY = 20           # ticks between transient spikes
 CABIN_RECOVERY_TICKS = 5   # ticks with a governor set before the cabin status clears
+COOLANT_GOVERNOR_MAX = 30  # a coolant leak clears only under a governor at or below this (km/h)
 TEMP_NOISE = 0.15          # standard deviation of sensor noise, degrees C
 SPEED_NOISE = 1.5
 
@@ -97,6 +102,9 @@ def build_profile(profile, cars, seed, silent_cars=0, silent_faulty=0):
         if profile == "dual":      # 1-2 dual-fault cars, 1-2 battery, 0-2 cabin, 0-2 blips: at least 2 fault cars
             pairs = [(DUAL_FAULT, layout_rng.randint(1, 2)), (BATTERY_RUNAWAY, layout_rng.randint(1, 2)),
                      (CABIN_INVERTER, layout_rng.randint(0, 2)), (TRANSIENT_SPIKE, layout_rng.randint(0, 2))]
+        elif profile == "manual_only":   # 1-2 coolant leaks next to 1-2 cabin and 1-2 battery faults, 0-2 blips
+            pairs = [(COOLANT_LEAK, layout_rng.randint(1, 2)), (CABIN_INVERTER, layout_rng.randint(1, 2)),
+                     (BATTERY_RUNAWAY, layout_rng.randint(1, 2)), (TRANSIENT_SPIKE, layout_rng.randint(0, 2))]
         else:
             pairs = list(zip((BATTERY_RUNAWAY, CABIN_INVERTER, TRANSIENT_SPIKE), counts))
         scenarios, silent_idx = assign(pairs)
@@ -158,12 +166,14 @@ class FleetModel:
         def ids(scenario):
             return [c.device_id for c in self.cars if c.scenario == scenario]
         battery, cabin, dual = ids(BATTERY_RUNAWAY), ids(CABIN_INVERTER), ids(DUAL_FAULT)
-        faulty = set(battery) | set(cabin) | set(dual)
+        coolant = ids(COOLANT_LEAK)
+        faulty = set(battery) | set(cabin) | set(dual) | set(coolant)
         return {
             "fault_start_tick": self.fault_start_tick,
             "battery": battery,
             "cabin": cabin,
             "dual": dual,                      # these cars need BOTH fixes
+            "coolant": coolant,                # these need the governor value from the manual
             "spikes": ids(TRANSIENT_SPIKE),
             "silent": sorted(self.silent_ids),
             "silent_faulty": sorted(self.silent_ids & faulty),   # faulty cars whose fault the feed never shows
@@ -199,6 +209,12 @@ class FleetModel:
                 else:
                     cabin_status = "overheating_critical"
                     speed = self.rng.uniform(65.0, 78.0)
+
+            if car.scenario == COOLANT_LEAK and faulting:
+                if governor is not None and governor <= COOLANT_GOVERNOR_MAX:
+                    car.governed_ticks += 1
+                if car.governed_ticks < CABIN_RECOVERY_TICKS:
+                    cabin_status = "coolant_leak"
 
             temp += car.heat + self.rng.gauss(0, TEMP_NOISE)
 

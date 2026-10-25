@@ -260,3 +260,14 @@ def test_a_write_is_never_sent_when_the_feed_check_fails(isolated, monkeypatch):
     s = FakeSession([scan_reply([car("car_001", ["battery_sustained_anomaly"])])])
     run(s)
     assert s.writes() == []
+
+
+def test_rules_have_no_fix_for_a_coolant_leak_so_the_scorer_fails_them(isolated):
+    """The fix for cabin_coolant_leak is only in the manual. The rules leave the car alone and miss it."""
+    manifest = {"battery": [], "cabin": ["car_002"], "coolant": ["car_007"], "spikes": [], "silent": [], "freeze_after": None}
+    s = FakeSession([scan_reply([car("car_002", ["cabin_overheating_critical"]), car("car_007", ["cabin_coolant_leak"])]),
+                     scan_reply([car("car_007", ["cabin_coolant_leak"])])])
+    run(s)
+    assert s.writes() == [("car_002", "speed_governor", "50")]
+    result = score_session(manifest, summarize_session(split_sessions(events(isolated))[-1]))
+    assert not result["passed"] and result["missed"] == ["car_007"]

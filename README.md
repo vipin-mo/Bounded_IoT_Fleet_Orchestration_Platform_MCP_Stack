@@ -9,8 +9,9 @@ and a ground-truth scoring script measure how often it gets this right.
 
 **Result:** on 20 randomized fleets the agent fixed 43 of 43 injected faults and made no write to a healthy
 vehicle (20 of 20 runs passed, 95% interval 84% to 100%). A rule-based agent with no model passes the same
-cases, 20 seconds faster and with no tokens, so these cases test the safety layers and the detector, not the
-model. See [Results](#results) and [Claude versus rules](#claude-versus-a-rule-based-agent).
+cases, 20 seconds faster and with no tokens, so those cases test the safety layers and the detector, not the
+model. On a fault whose fix is written only in the maintenance manual, the rules passed 0 of 6 runs and Claude
+6 of 6. See [Results](#results) and [Claude versus rules](#claude-versus-a-rule-based-agent).
 
 This is a portfolio project, not production software. The fleet is a Python simulator, "OTA" means writing
 a field in a Redis hash, and Redis is a single container.
@@ -67,8 +68,8 @@ themselves (a window that contains the reading limits the z-score to 3 and hides
 
 | Classification | Meaning | Agent action |
 | --- | --- | --- |
-| `sustained_anomaly` | Median of the newest 5 is above 2.5 standard deviations (or above 60 °C) | Fix |
-| `rising_trend` | Steady climb, or two high readings in a row | Fix |
+| `sustained_anomaly` | Median of the newest 5 is more than 2.5 standard deviations above the baseline, or at least 60 °C | Fix |
+| `rising_trend` | The newest 5 climb faster than 0.3 °C per reading, or the newest reading is high and either the one before it was also high or the readings before it were already climbing | Fix |
 | `transient_spike` | One high reading after a normal one, with no climb before it | Ignore |
 | `nominal` | Everything else, including cooling after a fix | Nothing |
 | `insufficient_data` | Fewer than 15 readings | Wait |
@@ -116,6 +117,7 @@ if every fault is fixed, nothing else is written, and a later scan confirms the 
 
 Standard suite: random fault layouts, no faults, sensor blips only, five healthy cars going silent, and a
 dead feed. `--suite hard` adds a car with both faults, a faulty car that stops reporting, and a slow ramp.
+`--suite manual` adds a cabin coolant leak whose fix (a 30 km/h governor, not the usual 50) is only in the manual.
 `make eval-baseline` runs the same cases with the rule-based agent, with no key and no cost, to show what the
 model adds. See [docs/EVALUATION.md](docs/EVALUATION.md).
 
@@ -134,31 +136,40 @@ Claude Haiku 4.5, 20 seeded fleets, 2026-10-06 (files in `artifacts/eval_2026100
 - 20 of 20 runs passed (95% interval 84% to 100%). 43 of 43 injected faults fixed. No write to a healthy,
   blip or silent car.
 - Median 6 turns, 20.9k input tokens and 26 s per run.
-- Limits: one model, one run per seed, one day. The simulator, detector and scorer were written by the same
-  person. This run happened before a fix to the lone-spike rule (docs/DETECTION_LATENCY.md). The hard-suite
-  runs below and both rule-based runs used the fixed detector; Claude's standard suite was not repeated.
+- Limits: one model, one run per seed. The simulator, detector and scorer were written by the same person.
+  This run happened before a fix to the lone-spike rule (docs/DETECTION_LATENCY.md). Repeated on 2026-10-24
+  with the fixed detector on the same 20 seeds: 20 of 20 passed, 43 of 43 faults fixed, no false action,
+  median 21.5k input tokens and 24 s (`artifacts/eval_rerun_llm_20261024/`).
 
 ### Claude versus a rule-based agent
 
 Both agents ran the same seeded cases with the same tools, write checks and scorer
-(`artifacts/eval_20261006/`, `artifacts/eval_baseline_20261009/`, `artifacts/eval_hard_baseline_20261009/`,
-`artifacts/eval_hard_llm_20261009/`).
+(`artifacts/eval_rerun_llm_20261024/`, `artifacts/eval_baseline_20261009/`, `artifacts/eval_hard_baseline_20261009/`,
+`artifacts/eval_hard_llm_20261009/`, `artifacts/eval_manual_baseline_20261024/`, `artifacts/eval_manual_llm_20261024/`).
 
 | Suite | Agent | Runs passed | Faults fixed | Input tokens per run (median) | Seconds per run (median) |
 | --- | --- | --- | --- | --- | --- |
-| Standard, 20 fleets | Claude Haiku 4.5 | 20 / 20 | 43 / 43 | 20.9k | 26 |
+| Standard, 20 fleets | Claude Haiku 4.5 | 20 / 20 | 43 / 43 | 21.5k | 24 |
 | Standard, 20 fleets | Rules | 20 / 20 | 43 / 43 | 0 | 8 |
 | Hard, 12 fleets (dual fault, silent faulty car, slow ramp) | Claude Haiku 4.5 | 12 / 12 | 45 / 45 | 25.5k | 30 |
 | Hard, 12 fleets | Rules | 12 / 12 | 45 / 45 | 0 | 8 |
+| Manual-only, 6 fleets (coolant leak next to ordinary cabin and battery faults) | Claude Haiku 4.5 | 6 / 6 | 30 / 30 | 28.4k | 32 |
+| Manual-only, 6 fleets | Rules | 0 / 6 | 20 / 30 | 0 | 8 |
 
-- On these cases the model adds no accuracy. It adds about 20 seconds and 20k to 25k input tokens per run (8 s
-  of the rule agent's time is the fixed wait after a fix).
+- On the standard and hard suites the model adds no accuracy. It adds about 20 seconds and 20k to 25k input
+  tokens per run (8 s of the rule agent's time is the fixed wait after a fix).
 - The detection and the stale-data checks live in the Go server, so rules can act on what `scan_fleet` returns.
   That is a design choice, and it is why both agents pass.
-- 12 of 12 still allows a true pass rate near 76%, so these runs cannot rank the two agents.
-- What the model provides that these cases do not measure: choosing a fix from the manual for a fault the rules
-  do not know, and a written report. Its report numbers were sometimes wrong, so the scorer ignores them. The
-  rules' report is exact but short.
+- 12 of 12 still allows a true pass rate near 76%, so those runs cannot rank the two agents.
+- The manual-only suite adds a cabin status, `coolant_leak`, whose fix (speed governor 30 km/h) appears only in
+  `vehicle_fault_manual.md`. The system prompt still lists only the two original fixes, and a 50 km/h governor
+  does not clear the leak. In every run Claude searched the manual and wrote 30 to each leaking car and 50 to
+  each ordinary cabin fault. The rules fixed the faults they know and left every leaking car alone.
+- That gap is by construction: the rules have no entry for the new code, and adding one is a one-line change.
+  What the suite shows is that the agent follows a manual it was not told about in the prompt. 6 of 6 still
+  allows a true pass rate near 61%.
+- The model also writes a report. Its numbers were sometimes wrong, so the scorer ignores them. The rules'
+  report is exact but short.
 
 ## What went wrong along the way
 
@@ -179,8 +190,8 @@ Both agents ran the same seeded cases with the same tools, write checks and scor
 - One Redis container, one agent, no password on Redis (it listens on this machine only).
 - `search_maintenance_manual` is not a real search.
 - Agent decisions depend on the model. The unit tests do not cover them; `make eval` does, with a small sample.
-- The model's value is not demonstrated by these cases (see the comparison above). A case where the correct fix
-  exists only in the manual would test it.
+- Only one manual-only fault exists, and the same person wrote it, the manual entry and the scorer. A harder
+  test would use manual entries the author did not write, or a manual that contradicts the prompt.
 
 ## Layout
 

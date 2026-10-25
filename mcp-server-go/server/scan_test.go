@@ -73,6 +73,18 @@ func TestScanFlagsCabinFaultAndBatteryFaultTogether(t *testing.T) {
 	}
 }
 
+// A coolant leak shows only in the cabin register: normal speed, normal battery. Its fix is in the
+// manual, so the scan just has to pass the status through as an issue.
+func TestScanFlagsCoolantLeakAtNormalSpeedAndBattery(t *testing.T) {
+	fleet := healthy(100)
+	fleet[6].CabinStatus = "coolant_leak" // car_007
+	r := BuildScanReport(fleet)
+	f := findByID(r, "car_007")
+	if len(r.Flagged) != 1 || f == nil || len(f.Issues) != 1 || f.Issues[0] != "cabin_coolant_leak" {
+		t.Fatalf("want only car_007 flagged with cabin_coolant_leak, got %+v", r.Flagged)
+	}
+}
+
 func TestScanFlagsSlowRampAsRisingTrend(t *testing.T) {
 	fleet := healthy(100)
 	fleet[11].Temps = join(flatSeries(55, 30), rampTail(30, 0.35, 5)) // classified rising_trend, not sustained

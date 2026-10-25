@@ -6,6 +6,7 @@ agent once, stop the simulator, score the run against the simulator's ground tru
 
     python scripts/eval_runs.py --runs 20                 # about 20 minutes, a few dollars of API use
     python scripts/eval_runs.py --runs 12 --suite hard    # harder cases: dual faults, silent faulty cars, slow ramps
+    python scripts/eval_runs.py --runs 6 --suite manual   # a fault whose fix is only in the manual (rules cannot pass)
     python scripts/eval_runs.py --runs 20 --agent baseline   # the rule-based agent: same cases, no API key, no cost
     python scripts/eval_runs.py --runs 3 --seed-base 500  # quick check
     python scripts/eval_runs.py --score-ledger logs/fleet_agent_ledger_2026-10-06.jsonl \\
@@ -38,6 +39,9 @@ SUITE_PATTERN = ["random", "random", "none", "random", "spikes_only",
                  "random", "silent", "random", "freeze", "random"]
 # Harder cases (--suite hard). Each kind is one fault type the standard suite never uses.
 HARD_PATTERN = ["dual", "silent_fault", "slow_ramp"]
+# --suite manual: coolant-leak cars whose fix (speed_governor=30) is written only in the manual, next to
+# ordinary cabin cars that need 50. The rule-based agent has no rule for it, so this is where the model can win.
+MANUAL_PATTERN = ["manual_only"]
 SLOW_RAMP_HEAT = 0.15             # degrees C per second: the detector needs 8 to 11 s to see it (docs/DETECTION_LATENCY.md)
 SLOW_RAMP_LEAD_SECONDS = 25       # long enough that even the slowest measured detection has happened
 FAULT_STARTS = [20, 30, 40, 50]   # the detector needs about 15 readings of history before faults
@@ -49,7 +53,7 @@ FREEZE_AFTER_FAULT_START = 15     # ticks of faults written before the feed dies
 
 def build_suite(runs, seed_base, suite="standard"):
     """Return the list of cases. The same arguments always give the same suite."""
-    pattern = HARD_PATTERN if suite == "hard" else SUITE_PATTERN
+    pattern = {"hard": HARD_PATTERN, "manual": MANUAL_PATTERN}.get(suite, SUITE_PATTERN)
     cases = []
     for i in range(runs):
         kind = pattern[i % len(pattern)]
@@ -170,7 +174,7 @@ def score_case(case, manifest, ledger_text, return_code):
     result = score_session(manifest, summary)
     result.update(base)
     result["manifest"] = {k: manifest.get(k) for k in
-                          ("battery", "cabin", "dual", "spikes", "silent", "silent_faulty", "heat_per_tick", "freeze_after")}
+                          ("battery", "cabin", "dual", "coolant", "spikes", "silent", "silent_faulty", "heat_per_tick", "freeze_after")}
     return result
 
 
@@ -229,14 +233,14 @@ def parse_args(argv=None):
     p.add_argument("--max-invalid-streak", type=int, default=3,
                    help="stop the suite after this many invalid cases in a row (a setup problem repeats "
                         "every time; there is no point in waiting 20 minutes to learn that)")
-    p.add_argument("--suite", choices=["standard", "hard"], default="standard",
+    p.add_argument("--suite", choices=["standard", "hard", "manual"], default="standard",
                    help="standard: random faults and controls. hard: dual-fault cars, faulty cars that go "
-                        "silent, slow ramps")
+                        "silent, slow ramps. manual: a fault whose fix is only in the manual")
     p.add_argument("--agent", choices=["llm", "baseline"], default="llm",
                    help="llm: the Claude agent (API key, costs money). baseline: the rule-based agent "
                         "(no key, free), run on the same cases")
     p.add_argument("--only", help="comma-separated case kinds to keep from the suite "
-                                  "(standard: random, none, spikes_only, silent, freeze; hard: dual, silent_fault, slow_ramp)")
+                                  "(standard: random, none, spikes_only, silent, freeze; hard: dual, silent_fault, slow_ramp; manual: manual_only)")
     p.add_argument("--out", default=str(ROOT / "eval_results"))
     p.add_argument("--score-ledger", help="score sessions from an existing ledger instead of running")
     p.add_argument("--expect", choices=["default", "none", "stale"], default="default",
